@@ -72,7 +72,7 @@ NULLOP == [ obj |-> CHOOSE o \in Objects: TRUE,
             clientMsgQs[<<client, head>>] := Tail(clientMsgQs[<<client, head>>]);
             
             if (op.action = READ) {
-   
+                                
                 if (Head(objLogs[op.obj]).isDirty) {
                 
                         apportionQuery: msgQs[<<head, tail>>] := Append(msgQs[<<head, tail>>], op);
@@ -111,11 +111,37 @@ NULLOP == [ obj |-> CHOOSE o \in Objects: TRUE,
         }
     }
     
-\*    fair process tailProcess(name="tail") {
-\*        listen: while (TRUE) {
-\*        
-\*        }
-\*    }
+    fair process (name="tail") 
+        variables   prev = Ancestors[tail],
+                    src = CHOOSE n \in Nodes : TRUE,
+                    op = NULLOP,
+                    reply = NULLOP,
+                    objLogs = [o \in Obj |-> << >>];
+    {
+        listen: while (TRUE) {
+            src := CHOOSE n \in Nodes : msgQs[<<n, tail>>] /= << >>;
+            
+
+            op := Head(msgQs[<<src, tail>>])
+            msgQs[<<src, tail>>] := Tail(msgQs[<<src, tail>>])
+            
+            if (op.action = READ) {
+                readObj: reply := [ obj |-> op.obj, 
+                                    uniqueId |-> Head(objLogs[op.obj]).uniqueId,
+                                    action |-> WRITE];  
+                apportionResp: msgQs[<<tail, src>>] := Append(msgQs[<<tail, src>>], reply);
+            } else {
+            
+                applyWrite: objLogs[op.obj] := Append(objLogs[op.obj], [uniqueId |-> op.uniqueId, isDirty |-> FALSE]);
+                                 
+                ackSuccessfulWrite: reply := [  obj |-> op.obj,
+                                                uniqueId |-> op.uniqueId,
+                                                action |-> TRUE];
+                clientMsgQs[<<tail, src>>] := Append(clientMsgQs[<<tail, src>>], reply);     
+            } 
+        
+        }
+    }
 \*    
 \*    fair process nodeProcess(n \in Nodes \ {head, tail}) {
 \*        listen: while (TRUE) {
@@ -227,6 +253,6 @@ Spec == /\ Init /\ [][Next]_vars
 
 =============================================================================
 \* Modification History
+\* Last modified Sat May 27 01:14:05 EDT 2023 by jenniferlam
 \* Last modified Fri May 26 12:21:24 EDT 2023 by 72jen
-\* Last modified Thu May 25 18:14:22 EDT 2023 by jenniferlam
 \* Created Thu May 25 11:58:00 EDT 2023 by jenniferlam
