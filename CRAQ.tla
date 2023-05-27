@@ -38,8 +38,8 @@ NULLOP == [ obj |-> CHOOSE o \in Objects: TRUE,
             uniqueId |-> CHOOSE i \in Int : TRUE,
             action |-> CHOOSE a \in Actions : TRUE]
             
-NULLLOGENTRY == [   uniqueId |-> CHOOSE i \in Int : TRUE,
-                    isDirty |-> CHOOSE b \in {TRUE, FALSE} : TRUE]
+\*NULLLOGENTRY == [   uniqueId |-> CHOOSE i \in Int : TRUE,
+\*                    isDirty |-> CHOOSE b \in {TRUE, FALSE} : TRUE]
 \* LogEntry == [uniqueId (int), isDirty (bool) ]
 \* Operation == [obj (Object), uniqueId (int), action (Action)]
 
@@ -48,38 +48,39 @@ NULLLOGENTRY == [   uniqueId |-> CHOOSE i \in Int : TRUE,
 --fair algorithm CRAQ {
         variables   msgQs = [e \in Edges |-> << >>],
                     clientMsgQs = [ ce \in ClientEdges |-> << >>];
-                    
-    fair process(c \in Clients) 
-        variables x = 1;
-    {
-        temp: while (TRUE) {
-            x := 1;
-        }
-    }
+\*                    
+\*    fair process(c \in Clients) 
+\*        variables x = 1;
+\*    {
+\*        temp: while (TRUE) {
+\*            x := 1;
+\*        }
+\*    }
 
     fair process (name="head") 
         variables   next = Descendants[head],
                     op = NULLOP, 
                     reply = NULLOP,
+                    client = CHOOSE c \in Clients: TRUE,
                     objLogs = [o \in Objects |-> << >>]; 
     {
         listen: while (TRUE) {
         
-            with (client \in {c \in Clients : clientMsgQs[<<c, head>>] /= << >>}) {
-                                                       
-                op := Head(clientMsgQs[<<client, head>>]); 
-                clientMsgQs[<<client, head>>] := Tail(clientMsgQs[<<client, head>>]);
+            client := CHOOSE c \in Clients : clientMsgQs[<<c, head>>] /= << >>;                                           
             
-                if (op.action = READ) {
+            incomingClientReq: op := Head(clientMsgQs[<<client, head>>]); 
+            clientMsgQs[<<client, head>>] := Tail(clientMsgQs[<<client, head>>]);
+            
+            if (op.action = READ) {
    
-                    if (Head(objLogs[op.obj]).isDirty) {
+                if (Head(objLogs[op.obj]).isDirty) {
                 
-                        apportionQuery: msgQs[<<head, tail>>] := Append(msgQs[<<head, tail>>], op)
+                        apportionQuery: msgQs[<<head, tail>>] := Append(msgQs[<<head, tail>>], op);
                         await msgQs[<<tail, head>>] /= << >>;
-                        reply := Head(msgQs<<tail, head>>);
-                        msgQs<<tail, head>> := Tail(msgQs<<tail, head>>);
-                    
-                        returnToClient: clientMsgQs[<<head, client>>] := Append(clientMsgQs[<<head, client>>], reply); 
+                        
+                        returnFromTail: reply := Head(msgQs[<<tail, head>>]);
+                        msgQs[<<tail, head>>] := Tail(msgQs[<<tail, head>>]);
+                        clientMsgQs[<<head, client>>] := Append(clientMsgQs[<<head, client>>], reply); 
                     
                     
                     } else {
@@ -87,7 +88,7 @@ NULLLOGENTRY == [   uniqueId |-> CHOOSE i \in Int : TRUE,
                         readObj: reply := [ obj |-> op.obj, 
                                             uniqueId |-> Head(objLogs[op.obj]).uniqueId,
                                             action |-> WRITE];  
-                        returnToClient: clientMsgQs[<<head, client>>] := Append(clientMsgQs[<<head, client>>], reply);
+                        returnFromSelf: clientMsgQs[<<head, client>>] := Append(clientMsgQs[<<head, client>>], reply);
                     }
                 } else {
                     
@@ -95,12 +96,12 @@ NULLLOGENTRY == [   uniqueId |-> CHOOSE i \in Int : TRUE,
                     
                     propagate: msgQs[<<head, next>>] := Append(msgQs[<<head, next>>], op);
                     
-                    recvAck: await msgQs<<next, head>> /= << >>;
-                    msgQs<<next, head>> := Tail(msgQs<<next, head>>);
+                    recvAck: await msgQs[<<next, head>>] /= << >>;
+                    msgQs[<<next, head>>] := Tail(msgQs[<<next, head>>]);
                     
                     applyWrite: objLogs[op.obj].isDirty := FALSE;
                                  
-                    returnToClient: reply := [  obj |-> op.obj,
+                    ackSuccessfulWrite: reply := [  obj |-> op.obj,
                                                 uniqueId |-> op.uniqueId,
                                                 action |-> TRUE];
                     clientMsgQs[<<head, client>>] := Append(clientMsgQs[<<head, client>>], reply);                                         
@@ -122,11 +123,110 @@ NULLLOGENTRY == [   uniqueId |-> CHOOSE i \in Int : TRUE,
 \*        }
 \*        
 \*    }
-    
 }
 ****************************************************************************)
+\* BEGIN TRANSLATION (chksum(pcal) = "7d739e68" /\ chksum(tla) = "81b843e7")
+VARIABLES msgQs, clientMsgQs, pc, next, op, reply, client, objLogs
+
+vars == << msgQs, clientMsgQs, pc, next, op, reply, client, objLogs >>
+
+ProcSet == {"head"}
+
+Init == (* Global variables *)
+        /\ msgQs = [e \in Edges |-> << >>]
+        /\ clientMsgQs = [ ce \in ClientEdges |-> << >>]
+        (* Process name *)
+        /\ next = Descendants[head]
+        /\ op = NULLOP
+        /\ reply = NULLOP
+        /\ client = CHOOSE c \in Clients: TRUE
+        /\ objLogs = [o \in Objects |-> << >>]
+        /\ pc = [self \in ProcSet |-> "listen"]
+
+listen == /\ pc["head"] = "listen"
+          /\ client' = (CHOOSE c \in Clients : clientMsgQs[<<c, head>>] /= << >>)
+          /\ pc' = [pc EXCEPT !["head"] = "incomingClientReq"]
+          /\ UNCHANGED << msgQs, clientMsgQs, next, op, reply, objLogs >>
+
+incomingClientReq == /\ pc["head"] = "incomingClientReq"
+                     /\ op' = Head(clientMsgQs[<<client, head>>])
+                     /\ clientMsgQs' = [clientMsgQs EXCEPT ![<<client, head>>] = Tail(clientMsgQs[<<client, head>>])]
+                     /\ IF op'.action = READ
+                           THEN /\ IF Head(objLogs[op'.obj]).isDirty
+                                      THEN /\ pc' = [pc EXCEPT !["head"] = "apportionQuery"]
+                                      ELSE /\ pc' = [pc EXCEPT !["head"] = "readObj"]
+                           ELSE /\ pc' = [pc EXCEPT !["head"] = "dirtyWrite"]
+                     /\ UNCHANGED << msgQs, next, reply, client, objLogs >>
+
+dirtyWrite == /\ pc["head"] = "dirtyWrite"
+              /\ objLogs' = [objLogs EXCEPT ![op.obj] = Append(objLogs[op.obj], [uniqueId |-> op.uniqueId, isDirty |-> TRUE])]
+              /\ pc' = [pc EXCEPT !["head"] = "propagate"]
+              /\ UNCHANGED << msgQs, clientMsgQs, next, op, reply, client >>
+
+propagate == /\ pc["head"] = "propagate"
+             /\ msgQs' = [msgQs EXCEPT ![<<head, next>>] = Append(msgQs[<<head, next>>], op)]
+             /\ pc' = [pc EXCEPT !["head"] = "recvAck"]
+             /\ UNCHANGED << clientMsgQs, next, op, reply, client, objLogs >>
+
+recvAck == /\ pc["head"] = "recvAck"
+           /\ msgQs[<<next, head>>] /= << >>
+           /\ msgQs' = [msgQs EXCEPT ![<<next, head>>] = Tail(msgQs[<<next, head>>])]
+           /\ pc' = [pc EXCEPT !["head"] = "applyWrite"]
+           /\ UNCHANGED << clientMsgQs, next, op, reply, client, objLogs >>
+
+applyWrite == /\ pc["head"] = "applyWrite"
+              /\ objLogs' = [objLogs EXCEPT ![op.obj].isDirty = FALSE]
+              /\ pc' = [pc EXCEPT !["head"] = "ackSuccessfulWrite"]
+              /\ UNCHANGED << msgQs, clientMsgQs, next, op, reply, client >>
+
+ackSuccessfulWrite == /\ pc["head"] = "ackSuccessfulWrite"
+                      /\ reply' =  [  obj |-> op.obj,
+                                  uniqueId |-> op.uniqueId,
+                                  action |-> TRUE]
+                      /\ clientMsgQs' = [clientMsgQs EXCEPT ![<<head, client>>] = Append(clientMsgQs[<<head, client>>], reply')]
+                      /\ pc' = [pc EXCEPT !["head"] = "listen"]
+                      /\ UNCHANGED << msgQs, next, op, client, objLogs >>
+
+apportionQuery == /\ pc["head"] = "apportionQuery"
+                  /\ msgQs' = [msgQs EXCEPT ![<<head, tail>>] = Append(msgQs[<<head, tail>>], op)]
+                  /\ msgQs'[<<tail, head>>] /= << >>
+                  /\ pc' = [pc EXCEPT !["head"] = "returnFromTail"]
+                  /\ UNCHANGED << clientMsgQs, next, op, reply, client, 
+                                  objLogs >>
+
+returnFromTail == /\ pc["head"] = "returnFromTail"
+                  /\ reply' = Head(msgQs[<<tail, head>>])
+                  /\ msgQs' = [msgQs EXCEPT ![<<tail, head>>] = Tail(msgQs[<<tail, head>>])]
+                  /\ clientMsgQs' = [clientMsgQs EXCEPT ![<<head, client>>] = Append(clientMsgQs[<<head, client>>], reply')]
+                  /\ pc' = [pc EXCEPT !["head"] = "listen"]
+                  /\ UNCHANGED << next, op, client, objLogs >>
+
+readObj == /\ pc["head"] = "readObj"
+           /\ reply' = [ obj |-> op.obj,
+                         uniqueId |-> Head(objLogs[op.obj]).uniqueId,
+                         action |-> WRITE]
+           /\ pc' = [pc EXCEPT !["head"] = "returnFromSelf"]
+           /\ UNCHANGED << msgQs, clientMsgQs, next, op, client, objLogs >>
+
+returnFromSelf == /\ pc["head"] = "returnFromSelf"
+                  /\ clientMsgQs' = [clientMsgQs EXCEPT ![<<head, client>>] = Append(clientMsgQs[<<head, client>>], reply)]
+                  /\ pc' = [pc EXCEPT !["head"] = "listen"]
+                  /\ UNCHANGED << msgQs, next, op, reply, client, objLogs >>
+
+name == listen \/ incomingClientReq \/ dirtyWrite \/ propagate \/ recvAck
+           \/ applyWrite \/ ackSuccessfulWrite \/ apportionQuery
+           \/ returnFromTail \/ readObj \/ returnFromSelf
+
+Next == name
+
+Spec == /\ Init /\ [][Next]_vars
+        /\ WF_vars(Next)
+        /\ WF_vars(name)
+
+\* END TRANSLATION 
 
 =============================================================================
 \* Modification History
+\* Last modified Fri May 26 12:21:24 EDT 2023 by 72jen
 \* Last modified Thu May 25 18:14:22 EDT 2023 by jenniferlam
 \* Created Thu May 25 11:58:00 EDT 2023 by jenniferlam
