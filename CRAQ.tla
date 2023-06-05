@@ -1,9 +1,9 @@
 -------------------------------- MODULE CRAQ --------------------------------
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
-CONSTANTS Clients, Nodes, head, tail, NumMsgs, Objects
+CONSTANTS Clients, Nodes, head, tail, NumWrites, NumReads, Objects
 
-\*NumMsgs == NumWrites + NumReads
+NumMsgs == NumWrites + NumReads
 
 RECURSIVE FormChainTopology(_,_)
 FormChainTopology(curr, nodes) ==   IF nodes = {} THEN {} 
@@ -37,8 +37,8 @@ ASSUME  /\ head \in Nodes
         /\ Cardinality(UniqueIds) = Cardinality(Clients) * (NumMsgs + 1)
 -----------------------------------------------------------------------------
 
-READ == TRUE
-WRITE == ~READ
+READ == "READ"
+WRITE == "WRITE"
 Actions == {READ, WRITE}
 
 
@@ -64,15 +64,15 @@ LogEntryType == [uniqueId: UniqueIds, isDirty: {TRUE, FALSE}]
         \* operator definitions
         define {
             
-            PotentialRequestClients(n) == IF n = head THEN Clients ELSE {Predecessors[n]} \cup Clients
+            sendersTo(n) == IF n = head THEN Clients ELSE {Predecessors[n]} \cup Clients
 
-            readObjFromSelf(objLogs, obj) == LET log == objLogs[obj] IN
-                                                IF log = << >> THEN [   obj |-> obj,
-                                                                        uniqueId |-> <<CHOOSE cl \in Clients: TRUE, 0>>,
-                                                                        action |-> READ]
-                                                    ELSE [  obj |-> obj, 
-                                                            uniqueId |-> Head(objLogs[obj]).uniqueId, 
-                                                            action |-> WRITE]
+            read(objLogs, obj) == LET log == objLogs[obj] IN
+                                    IF log = << >> THEN [   obj |-> obj,
+                                                            uniqueId |-> <<CHOOSE cl \in Clients: TRUE, 0>>,
+                                                            action |-> READ]
+                                    ELSE [  obj |-> obj, 
+                                            uniqueId |-> Head(objLogs[obj]).uniqueId, 
+                                            action |-> WRITE]
                                                             
             isDirtyVersion(objLogs, obj) == Head(objLogs[obj]).isDirty
             
@@ -94,7 +94,7 @@ LogEntryType == [uniqueId: UniqueIds, isDirty: {TRUE, FALSE}]
             objLogs[obj] := Append(@, [uniqueId |-> uniqueId, isDirty |-> TRUE]);
         }
         macro applyDirtyWrite(objLogs, obj) {
-            objLogs[obj] := Append(Tail(@), [Head(@) EXCEPT !.isDirty = TRUE]); 
+            objLogs[obj] := Append(Tail(@), [Head(@) EXCEPT !.isDirty = FALSE]); 
         }
         
         \* procedures
@@ -117,17 +117,33 @@ LogEntryType == [uniqueId: UniqueIds, isDirty: {TRUE, FALSE}]
                     objects = Objects,
                     obj = defaultOp, resp_c = defaultOp, op_c = defaultOp;
     {
-        newMsg: while (sequencer <= NumMsgs) {
-            newObj: while (objects /= {}) {
+        newWrites: while (sequencer <= NumWrites) {
+            newObj_w: while (objects /= {}) {
                 obj := CHOOSE o \in objects : TRUE; 
                 op_c := [   obj |-> obj,
                             uniqueId |-> <<self, sequencer>>,
                             action |-> WRITE];
                 call query(self, head, op_c, resp_c);
-                decrement: objects := @ \ {obj};
+                decrement_w: objects := @ \ {obj};
             };
             
-            increment: 
+            increment_w: 
+            sequencer := @ + 1;
+            clientOpSet := clientOpSet \cup {op_c};
+            objects := Objects;
+        };
+        
+        newReads: while (sequencer <= NumWrites + NumReads) {
+            newObj_r: while (objects /= {}) {
+                obj := CHOOSE o \in objects : TRUE; 
+                op_c := [   obj |-> obj,
+                            uniqueId |-> <<self, sequencer>>,
+                            action |-> READ];
+                call query(self, head, op_c, resp_c);
+                decrement_r: objects := @ \ {obj};
+            };
+            
+            increment_r: 
             sequencer := @ + 1;
             clientOpSet := clientOpSet \cup {op_c};
             objects := Objects;
@@ -136,130 +152,124 @@ LogEntryType == [uniqueId: UniqueIds, isDirty: {TRUE, FALSE}]
 
     fair process (headProcess="head") 
         variables   succ_h = Successors[head],
-                    op_h = defaultOp, resp_h = defaultOp, requester_h = defaultClient; 
+                    op_h = defaultOp, resp_h = defaultOp, sender_h = defaultClient; 
     {
-        listen_head: 
+        listen_h: 
         while (TRUE) {
         
-            with (temp \in {c \in PotentialRequestClients(head): msgQs[<<c, head>>] /= << >>}) {
-                requester_h := temp;
+            
+            with (temp \in {s \in sendersTo(head): msgQs[<<s, head>>] /= << >>}) {
+                sender_h := temp;
             };
-                                                       
-            incomingClientReq_h: 
-            rcv(<<requester_h, head>>, op_h); 
+            
+            incomingReq_h:                                           
+            rcv(<<sender_h, head>>, op_h); 
             if (op_h.action = READ) {
             
-                readingObj_h: if (isDirtyVersion(allObjLogs[head], op_h.obj)) {
-                    call query(head, tail, op_h, resp_h);
+                checkDirty_h: if (isDirtyVersion(allObjLogs[head], op_h.obj)) {
+                    apportion_h: call query(head, tail, op_h, resp_h);
                 } else {    
-                    resp_h := readObjFromSelf(allObjLogs[head], op_h.obj);
+                    readFromSelf_h: 
+                    resp_h := read(allObjLogs[head], op_h.obj);
                 };
                 
-                respondTorequester_h: send(<<head, requester_h>>, resp_h);
+                replyToReadReq_h: send(<<head, sender_h>>, resp_h);
                 
-            } else {
-                    
-                dirtyWrite_h: dirtyWriteObj(allObjLogs[head], op_h.obj, op_h.uniqueId);
+            } else {     
+                dirtyWriteObj(allObjLogs[head], op_h.obj, op_h.uniqueId);
                     
                 propagate_h: send(<<head, succ_h>>, op_h);
                     
-                recvAck_h: rcv(<<succ_h, head>>, resp_h);
-                    
-                applyWrite_h: applyDirtyWrite(allObjLogs[head], op_h.obj);
+                recvAck_h: rcv(<<succ_h, head>>, resp_h);  
+                applyDirtyWrite(allObjLogs[head], op_h.obj);
                                  
-                ackSuccessfulWrite_h: resp_h := [   obj |-> op_h.obj,
-                                                    uniqueId |-> op_h.uniqueId,
-                                                    action |-> TRUE];
-                send(<<head, requester_h>>, resp_h);                                        
+                sendAck_h: send(<<head, sender_h>>, [   obj |-> op_h.obj,
+                                                        uniqueId |-> op_h.uniqueId,
+                                                        action |-> WRITE]);                                        
             }
         }
     }
     
     fair process (tailProcess="tail") 
         variables   op_t = defaultOp, resp_t = defaultOp, 
-                    requester_t = defaultSrcDestNode;
+                    sender_t = defaultSrcDestNode;
     {
         listen_t: while (TRUE) {
-        
-            with (temp \in {n \in PotentialRequestClients(tail) : msgQs[<<n, tail>>] /= << >>}) {
-                requester_t := temp;
+            
+            
+            with (temp \in {s \in sendersTo(tail) : msgQs[<<s, tail>>] /= << >>}) {
+                sender_t := temp;
             };
             
             incomingReq_t:
-            rcv(<<requester_t, tail>>, op_t); 
+            rcv(<<sender_t, tail>>, op_t); 
+            totalOrder[op_t.obj] := Append(@, op_t);
             if (op_t.action = READ) {
-                readObj_t: resp_t := readObjFromSelf(allObjLogs[tail], op_t.obj); 
-                
-                respond_t: send(<<tail, requester_t>>, resp_t);
-                 
+                replyToReadReq_t: 
+                resp_t := read(allObjLogs[tail], op_t.obj); 
+                send(<<tail, sender_t>>, resp_t);        
             } else {
-            
-                applyWrite_t: allObjLogs[tail][op_t.obj] := Append(allObjLogs[tail][op_t.obj], 
-                                          [uniqueId |-> op_t.uniqueId, isDirty |-> FALSE]);
+                allObjLogs[tail][op_t.obj] := Append(@, [uniqueId |-> op_t.uniqueId, isDirty |-> FALSE]);
                                  
-                ackSuccessfulWrite_t: resp_t := [  obj |-> op_t.obj,
-                                                uniqueId |-> op_t.uniqueId,
-                                                action |-> TRUE];
-                send(<<tail, requester_t>>, resp_t);     
+                sendAck_t: send(<<tail, sender_t>>, [    obj |-> op_t.obj,
+                                                            uniqueId |-> op_t.uniqueId,
+                                                            action |-> WRITE]);     
             }; 
-            
-            totallyOrder: totalOrder[op_t.obj] := Append(@, op_t);
         }
     }
     
     fair process (n \in Nodes \ {head, tail})
         variables   prev = Predecessors[self],
                     succ = Successors[self],
-                    op = defaultOp, resp = defaultOp, requester = defaultSrcDestNode; 
+                    op = defaultOp, resp = defaultOp, sender = defaultSrcDestNode; 
     {
         listen: while (TRUE) {
-        
-            with (temp \in {n \in PotentialRequestClients(self) : msgQs[<<n, self>>] /= << >>}) {
-                requester := temp;
+            
+            
+            with (temp \in {n \in sendersTo(self) : msgQs[<<n, self>>] /= << >>}) {
+                sender := temp;
             };
             
-            incomingReq: 
-            rcv(<<requester, self>>, op); 
+            incomingReq:
+            rcv(<<sender, self>>, op); 
             if (op.action = READ) {
             
-                readingObj: if (isDirtyVersion(allObjLogs[self], op.obj)) {
+                if (isDirtyVersion(allObjLogs[self], op.obj)) {
                     call query(self, tail, op, resp);
                 } else {    
-                    resp := readObjFromSelf(allObjLogs[self], op.obj);
+                    resp := read(allObjLogs[self], op.obj);
                 };
                 
-                respondToClient: send(<<self, requester>>, resp);
+                replyToReadReq: send(<<self, sender>>, resp);
             } else {
-                dirtyWrite: dirtyWriteObj(allObjLogs[self], op.obj, op.uniqueId);
+                dirtyWriteObj(allObjLogs[self], op.obj, op.uniqueId);
                     
                 propagate: send(<<self, succ>>, op);
                     
                 recvAck: rcv(<<succ, self>>, resp);
                     
-                applyWrite: applyDirtyWrite(allObjLogs[self], op.obj);
-                                 
-                ackSuccessfulWrite: resp := [   obj |-> op.obj,
+                sendAck: applyDirtyWrite(allObjLogs[self], op.obj);
+                send(<<self, prev>>, [  obj |-> op.obj,
                                                 uniqueId |-> op.uniqueId,
-                                                action |-> TRUE];
-                send(<<self, prev>>, resp); 
+                                                action |-> WRITE]); 
             }
         }  
     }
 }
 ****************************************************************************)
-\* BEGIN TRANSLATION (chksum(pcal) = "97233a0d" /\ chksum(tla) = "a8d45b4f")
+\* BEGIN TRANSLATION (chksum(pcal) = "d09b5fa9" /\ chksum(tla) = "cf6b4f99")
 VARIABLES msgQs, allObjLogs, clientOpSet, totalOrder, pc, stack
 
 (* define statement *)
-PotentialRequestClients(n) == IF n = head THEN Clients ELSE {Predecessors[n]} \cup Clients
+sendersTo(n) == IF n = head THEN Clients ELSE {Predecessors[n]} \cup Clients
 
-readObjFromSelf(objLogs, obj) == LET log == objLogs[obj] IN
-                                    IF log = << >> THEN [   obj |-> obj,
-                                                            uniqueId |-> <<CHOOSE cl \in Clients: TRUE, 0>>,
-                                                            action |-> READ]
-                                        ELSE [  obj |-> obj,
-                                                uniqueId |-> Head(objLogs[obj]).uniqueId,
-                                                action |-> WRITE]
+read(objLogs, obj) == LET log == objLogs[obj] IN
+                        IF log = << >> THEN [   obj |-> obj,
+                                                uniqueId |-> <<CHOOSE cl \in Clients: TRUE, 0>>,
+                                                action |-> READ]
+                        ELSE [  obj |-> obj,
+                                uniqueId |-> Head(objLogs[obj]).uniqueId,
+                                action |-> WRITE]
 
 isDirtyVersion(objLogs, obj) == Head(objLogs[obj]).isDirty
 
@@ -268,13 +278,13 @@ defaultSrcDestNode == CHOOSE node \in Nodes \cup Clients : TRUE
 defaultClient == CHOOSE client \in Clients : TRUE
 
 VARIABLES src, dest, op_query, resp_query, sequencer, objects, obj, resp_c, 
-          op_c, succ_h, op_h, resp_h, requester_h, op_t, resp_t, requester_t, 
-          prev, succ, op, resp, requester
+          op_c, succ_h, op_h, resp_h, sender_h, op_t, resp_t, sender_t, prev, 
+          succ, op, resp, sender
 
 vars == << msgQs, allObjLogs, clientOpSet, totalOrder, pc, stack, src, dest, 
            op_query, resp_query, sequencer, objects, obj, resp_c, op_c, 
-           succ_h, op_h, resp_h, requester_h, op_t, resp_t, requester_t, prev, 
-           succ, op, resp, requester >>
+           succ_h, op_h, resp_h, sender_h, op_t, resp_t, sender_t, prev, succ, 
+           op, resp, sender >>
 
 ProcSet == (Clients) \cup {"head"} \cup {"tail"} \cup (Nodes \ {head, tail})
 
@@ -298,20 +308,20 @@ Init == (* Global variables *)
         /\ succ_h = Successors[head]
         /\ op_h = defaultOp
         /\ resp_h = defaultOp
-        /\ requester_h = defaultClient
+        /\ sender_h = defaultClient
         (* Process tailProcess *)
         /\ op_t = defaultOp
         /\ resp_t = defaultOp
-        /\ requester_t = defaultSrcDestNode
+        /\ sender_t = defaultSrcDestNode
         (* Process n *)
         /\ prev = [self \in Nodes \ {head, tail} |-> Predecessors[self]]
         /\ succ = [self \in Nodes \ {head, tail} |-> Successors[self]]
         /\ op = [self \in Nodes \ {head, tail} |-> defaultOp]
         /\ resp = [self \in Nodes \ {head, tail} |-> defaultOp]
-        /\ requester = [self \in Nodes \ {head, tail} |-> defaultSrcDestNode]
+        /\ sender = [self \in Nodes \ {head, tail} |-> defaultSrcDestNode]
         /\ stack = [self \in ProcSet |-> << >>]
-        /\ pc = [self \in ProcSet |-> CASE self \in Clients -> "newMsg"
-                                        [] self = "head" -> "listen_head"
+        /\ pc = [self \in ProcSet |-> CASE self \in Clients -> "newWrites"
+                                        [] self = "head" -> "listen_h"
                                         [] self = "tail" -> "listen_t"
                                         [] self \in Nodes \ {head, tail} -> "listen"]
 
@@ -321,9 +331,8 @@ sendQuery(self) == /\ pc[self] = "sendQuery"
                    /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, stack, 
                                    src, dest, op_query, resp_query, sequencer, 
                                    objects, obj, resp_c, op_c, succ_h, op_h, 
-                                   resp_h, requester_h, op_t, resp_t, 
-                                   requester_t, prev, succ, op, resp, 
-                                   requester >>
+                                   resp_h, sender_h, op_t, resp_t, sender_t, 
+                                   prev, succ, op, resp, sender >>
 
 rcvResp(self) == /\ pc[self] = "rcvResp"
                  /\ msgQs[(<<dest[self], src[self]>>)] /= << >>
@@ -332,9 +341,9 @@ rcvResp(self) == /\ pc[self] = "rcvResp"
                  /\ pc' = [pc EXCEPT ![self] = "ret"]
                  /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, stack, 
                                  src, dest, op_query, sequencer, objects, obj, 
-                                 resp_c, op_c, succ_h, op_h, resp_h, 
-                                 requester_h, op_t, resp_t, requester_t, prev, 
-                                 succ, op, resp, requester >>
+                                 resp_c, op_c, succ_h, op_h, resp_h, sender_h, 
+                                 op_t, resp_t, sender_t, prev, succ, op, resp, 
+                                 sender >>
 
 ret(self) == /\ pc[self] = "ret"
              /\ pc' = [pc EXCEPT ![self] = Head(stack[self]).pc]
@@ -345,137 +354,200 @@ ret(self) == /\ pc[self] = "ret"
              /\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]
              /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, 
                              sequencer, objects, obj, resp_c, op_c, succ_h, 
-                             op_h, resp_h, requester_h, op_t, resp_t, 
-                             requester_t, prev, succ, op, resp, requester >>
+                             op_h, resp_h, sender_h, op_t, resp_t, sender_t, 
+                             prev, succ, op, resp, sender >>
 
 query(self) == sendQuery(self) \/ rcvResp(self) \/ ret(self)
 
-newMsg(self) == /\ pc[self] = "newMsg"
-                /\ IF sequencer[self] <= NumMsgs
-                      THEN /\ pc' = [pc EXCEPT ![self] = "newObj"]
-                      ELSE /\ pc' = [pc EXCEPT ![self] = "Done"]
+newWrites(self) == /\ pc[self] = "newWrites"
+                   /\ IF sequencer[self] <= NumWrites
+                         THEN /\ pc' = [pc EXCEPT ![self] = "newObj_w"]
+                         ELSE /\ pc' = [pc EXCEPT ![self] = "newReads"]
+                   /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, 
+                                   stack, src, dest, op_query, resp_query, 
+                                   sequencer, objects, obj, resp_c, op_c, 
+                                   succ_h, op_h, resp_h, sender_h, op_t, 
+                                   resp_t, sender_t, prev, succ, op, resp, 
+                                   sender >>
+
+newObj_w(self) == /\ pc[self] = "newObj_w"
+                  /\ IF objects[self] /= {}
+                        THEN /\ obj' = [obj EXCEPT ![self] = CHOOSE o \in objects[self] : TRUE]
+                             /\ op_c' = [op_c EXCEPT ![self] = [   obj |-> obj'[self],
+                                                                   uniqueId |-> <<self, sequencer[self]>>,
+                                                                   action |-> WRITE]]
+                             /\ /\ dest' = [dest EXCEPT ![self] = head]
+                                /\ op_query' = [op_query EXCEPT ![self] = op_c'[self]]
+                                /\ resp_query' = [resp_query EXCEPT ![self] = resp_c[self]]
+                                /\ src' = [src EXCEPT ![self] = self]
+                                /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "query",
+                                                                         pc        |->  "decrement_w",
+                                                                         src       |->  src[self],
+                                                                         dest      |->  dest[self],
+                                                                         op_query  |->  op_query[self],
+                                                                         resp_query |->  resp_query[self] ] >>
+                                                                     \o stack[self]]
+                             /\ pc' = [pc EXCEPT ![self] = "sendQuery"]
+                        ELSE /\ pc' = [pc EXCEPT ![self] = "increment_w"]
+                             /\ UNCHANGED << stack, src, dest, op_query, 
+                                             resp_query, obj, op_c >>
+                  /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, 
+                                  sequencer, objects, resp_c, succ_h, op_h, 
+                                  resp_h, sender_h, op_t, resp_t, sender_t, 
+                                  prev, succ, op, resp, sender >>
+
+decrement_w(self) == /\ pc[self] = "decrement_w"
+                     /\ objects' = [objects EXCEPT ![self] = @ \ {obj[self]}]
+                     /\ pc' = [pc EXCEPT ![self] = "newObj_w"]
+                     /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, 
+                                     totalOrder, stack, src, dest, op_query, 
+                                     resp_query, sequencer, obj, resp_c, op_c, 
+                                     succ_h, op_h, resp_h, sender_h, op_t, 
+                                     resp_t, sender_t, prev, succ, op, resp, 
+                                     sender >>
+
+increment_w(self) == /\ pc[self] = "increment_w"
+                     /\ sequencer' = [sequencer EXCEPT ![self] = @ + 1]
+                     /\ clientOpSet' = (clientOpSet \cup {op_c[self]})
+                     /\ objects' = [objects EXCEPT ![self] = Objects]
+                     /\ pc' = [pc EXCEPT ![self] = "newWrites"]
+                     /\ UNCHANGED << msgQs, allObjLogs, totalOrder, stack, src, 
+                                     dest, op_query, resp_query, obj, resp_c, 
+                                     op_c, succ_h, op_h, resp_h, sender_h, 
+                                     op_t, resp_t, sender_t, prev, succ, op, 
+                                     resp, sender >>
+
+newReads(self) == /\ pc[self] = "newReads"
+                  /\ IF sequencer[self] <= NumWrites + NumReads
+                        THEN /\ pc' = [pc EXCEPT ![self] = "newObj_r"]
+                        ELSE /\ pc' = [pc EXCEPT ![self] = "Done"]
+                  /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, 
+                                  stack, src, dest, op_query, resp_query, 
+                                  sequencer, objects, obj, resp_c, op_c, 
+                                  succ_h, op_h, resp_h, sender_h, op_t, resp_t, 
+                                  sender_t, prev, succ, op, resp, sender >>
+
+newObj_r(self) == /\ pc[self] = "newObj_r"
+                  /\ IF objects[self] /= {}
+                        THEN /\ obj' = [obj EXCEPT ![self] = CHOOSE o \in objects[self] : TRUE]
+                             /\ op_c' = [op_c EXCEPT ![self] = [   obj |-> obj'[self],
+                                                                   uniqueId |-> <<self, sequencer[self]>>,
+                                                                   action |-> READ]]
+                             /\ /\ dest' = [dest EXCEPT ![self] = head]
+                                /\ op_query' = [op_query EXCEPT ![self] = op_c'[self]]
+                                /\ resp_query' = [resp_query EXCEPT ![self] = resp_c[self]]
+                                /\ src' = [src EXCEPT ![self] = self]
+                                /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "query",
+                                                                         pc        |->  "decrement_r",
+                                                                         src       |->  src[self],
+                                                                         dest      |->  dest[self],
+                                                                         op_query  |->  op_query[self],
+                                                                         resp_query |->  resp_query[self] ] >>
+                                                                     \o stack[self]]
+                             /\ pc' = [pc EXCEPT ![self] = "sendQuery"]
+                        ELSE /\ pc' = [pc EXCEPT ![self] = "increment_r"]
+                             /\ UNCHANGED << stack, src, dest, op_query, 
+                                             resp_query, obj, op_c >>
+                  /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, 
+                                  sequencer, objects, resp_c, succ_h, op_h, 
+                                  resp_h, sender_h, op_t, resp_t, sender_t, 
+                                  prev, succ, op, resp, sender >>
+
+decrement_r(self) == /\ pc[self] = "decrement_r"
+                     /\ objects' = [objects EXCEPT ![self] = @ \ {obj[self]}]
+                     /\ pc' = [pc EXCEPT ![self] = "newObj_r"]
+                     /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, 
+                                     totalOrder, stack, src, dest, op_query, 
+                                     resp_query, sequencer, obj, resp_c, op_c, 
+                                     succ_h, op_h, resp_h, sender_h, op_t, 
+                                     resp_t, sender_t, prev, succ, op, resp, 
+                                     sender >>
+
+increment_r(self) == /\ pc[self] = "increment_r"
+                     /\ sequencer' = [sequencer EXCEPT ![self] = @ + 1]
+                     /\ clientOpSet' = (clientOpSet \cup {op_c[self]})
+                     /\ objects' = [objects EXCEPT ![self] = Objects]
+                     /\ pc' = [pc EXCEPT ![self] = "newReads"]
+                     /\ UNCHANGED << msgQs, allObjLogs, totalOrder, stack, src, 
+                                     dest, op_query, resp_query, obj, resp_c, 
+                                     op_c, succ_h, op_h, resp_h, sender_h, 
+                                     op_t, resp_t, sender_t, prev, succ, op, 
+                                     resp, sender >>
+
+client(self) == newWrites(self) \/ newObj_w(self) \/ decrement_w(self)
+                   \/ increment_w(self) \/ newReads(self) \/ newObj_r(self)
+                   \/ decrement_r(self) \/ increment_r(self)
+
+listen_h == /\ pc["head"] = "listen_h"
+            /\ \E temp \in {s \in sendersTo(head): msgQs[<<s, head>>] /= << >>}:
+                 sender_h' = temp
+            /\ pc' = [pc EXCEPT !["head"] = "incomingReq_h"]
+            /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, stack, 
+                            src, dest, op_query, resp_query, sequencer, 
+                            objects, obj, resp_c, op_c, succ_h, op_h, resp_h, 
+                            op_t, resp_t, sender_t, prev, succ, op, resp, 
+                            sender >>
+
+incomingReq_h == /\ pc["head"] = "incomingReq_h"
+                 /\ msgQs[(<<sender_h, head>>)] /= << >>
+                 /\ op_h' = Head(msgQs[(<<sender_h, head>>)])
+                 /\ msgQs' = [msgQs EXCEPT ![(<<sender_h, head>>)] = Tail(@)]
+                 /\ IF op_h'.action = READ
+                       THEN /\ pc' = [pc EXCEPT !["head"] = "checkDirty_h"]
+                            /\ UNCHANGED allObjLogs
+                       ELSE /\ allObjLogs' = [allObjLogs EXCEPT ![head][(op_h'.obj)] = Append(@, [uniqueId |-> (op_h'.uniqueId), isDirty |-> TRUE])]
+                            /\ pc' = [pc EXCEPT !["head"] = "propagate_h"]
+                 /\ UNCHANGED << clientOpSet, totalOrder, stack, src, dest, 
+                                 op_query, resp_query, sequencer, objects, obj, 
+                                 resp_c, op_c, succ_h, resp_h, sender_h, op_t, 
+                                 resp_t, sender_t, prev, succ, op, resp, 
+                                 sender >>
+
+checkDirty_h == /\ pc["head"] = "checkDirty_h"
+                /\ IF isDirtyVersion(allObjLogs[head], op_h.obj)
+                      THEN /\ pc' = [pc EXCEPT !["head"] = "apportion_h"]
+                      ELSE /\ pc' = [pc EXCEPT !["head"] = "readFromSelf_h"]
                 /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, 
                                 stack, src, dest, op_query, resp_query, 
                                 sequencer, objects, obj, resp_c, op_c, succ_h, 
-                                op_h, resp_h, requester_h, op_t, resp_t, 
-                                requester_t, prev, succ, op, resp, requester >>
+                                op_h, resp_h, sender_h, op_t, resp_t, sender_t, 
+                                prev, succ, op, resp, sender >>
 
-newObj(self) == /\ pc[self] = "newObj"
-                /\ IF objects[self] /= {}
-                      THEN /\ obj' = [obj EXCEPT ![self] = CHOOSE o \in objects[self] : TRUE]
-                           /\ op_c' = [op_c EXCEPT ![self] = [   obj |-> obj'[self],
-                                                                 uniqueId |-> <<self, sequencer[self]>>,
-                                                                 action |-> WRITE]]
-                           /\ /\ dest' = [dest EXCEPT ![self] = head]
-                              /\ op_query' = [op_query EXCEPT ![self] = op_c'[self]]
-                              /\ resp_query' = [resp_query EXCEPT ![self] = resp_c[self]]
-                              /\ src' = [src EXCEPT ![self] = self]
-                              /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "query",
-                                                                       pc        |->  "decrement",
-                                                                       src       |->  src[self],
-                                                                       dest      |->  dest[self],
-                                                                       op_query  |->  op_query[self],
-                                                                       resp_query |->  resp_query[self] ] >>
-                                                                   \o stack[self]]
-                           /\ pc' = [pc EXCEPT ![self] = "sendQuery"]
-                      ELSE /\ pc' = [pc EXCEPT ![self] = "increment"]
-                           /\ UNCHANGED << stack, src, dest, op_query, 
-                                           resp_query, obj, op_c >>
-                /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, 
-                                sequencer, objects, resp_c, succ_h, op_h, 
-                                resp_h, requester_h, op_t, resp_t, requester_t, 
-                                prev, succ, op, resp, requester >>
-
-decrement(self) == /\ pc[self] = "decrement"
-                   /\ objects' = [objects EXCEPT ![self] = @ \ {obj[self]}]
-                   /\ pc' = [pc EXCEPT ![self] = "newObj"]
-                   /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, 
-                                   stack, src, dest, op_query, resp_query, 
-                                   sequencer, obj, resp_c, op_c, succ_h, op_h, 
-                                   resp_h, requester_h, op_t, resp_t, 
-                                   requester_t, prev, succ, op, resp, 
-                                   requester >>
-
-increment(self) == /\ pc[self] = "increment"
-                   /\ sequencer' = [sequencer EXCEPT ![self] = @ + 1]
-                   /\ clientOpSet' = (clientOpSet \cup {op_c[self]})
-                   /\ objects' = [objects EXCEPT ![self] = Objects]
-                   /\ pc' = [pc EXCEPT ![self] = "newMsg"]
-                   /\ UNCHANGED << msgQs, allObjLogs, totalOrder, stack, src, 
-                                   dest, op_query, resp_query, obj, resp_c, 
-                                   op_c, succ_h, op_h, resp_h, requester_h, 
-                                   op_t, resp_t, requester_t, prev, succ, op, 
-                                   resp, requester >>
-
-client(self) == newMsg(self) \/ newObj(self) \/ decrement(self)
-                   \/ increment(self)
-
-listen_head == /\ pc["head"] = "listen_head"
-               /\ \E temp \in {c \in PotentialRequestClients(head): msgQs[<<c, head>>] /= << >>}:
-                    requester_h' = temp
-               /\ pc' = [pc EXCEPT !["head"] = "incomingClientReq_h"]
+apportion_h == /\ pc["head"] = "apportion_h"
+               /\ /\ dest' = [dest EXCEPT !["head"] = tail]
+                  /\ op_query' = [op_query EXCEPT !["head"] = op_h]
+                  /\ resp_query' = [resp_query EXCEPT !["head"] = resp_h]
+                  /\ src' = [src EXCEPT !["head"] = head]
+                  /\ stack' = [stack EXCEPT !["head"] = << [ procedure |->  "query",
+                                                             pc        |->  "replyToReadReq_h",
+                                                             src       |->  src["head"],
+                                                             dest      |->  dest["head"],
+                                                             op_query  |->  op_query["head"],
+                                                             resp_query |->  resp_query["head"] ] >>
+                                                         \o stack["head"]]
+               /\ pc' = [pc EXCEPT !["head"] = "sendQuery"]
                /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, 
-                               stack, src, dest, op_query, resp_query, 
                                sequencer, objects, obj, resp_c, op_c, succ_h, 
-                               op_h, resp_h, op_t, resp_t, requester_t, prev, 
-                               succ, op, resp, requester >>
+                               op_h, resp_h, sender_h, op_t, resp_t, sender_t, 
+                               prev, succ, op, resp, sender >>
 
-incomingClientReq_h == /\ pc["head"] = "incomingClientReq_h"
-                       /\ msgQs[(<<requester_h, head>>)] /= << >>
-                       /\ op_h' = Head(msgQs[(<<requester_h, head>>)])
-                       /\ msgQs' = [msgQs EXCEPT ![(<<requester_h, head>>)] = Tail(@)]
-                       /\ IF op_h'.action = READ
-                             THEN /\ pc' = [pc EXCEPT !["head"] = "readingObj_h"]
-                             ELSE /\ pc' = [pc EXCEPT !["head"] = "dirtyWrite_h"]
-                       /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, 
-                                       stack, src, dest, op_query, resp_query, 
-                                       sequencer, objects, obj, resp_c, op_c, 
-                                       succ_h, resp_h, requester_h, op_t, 
-                                       resp_t, requester_t, prev, succ, op, 
-                                       resp, requester >>
+readFromSelf_h == /\ pc["head"] = "readFromSelf_h"
+                  /\ resp_h' = read(allObjLogs[head], op_h.obj)
+                  /\ pc' = [pc EXCEPT !["head"] = "replyToReadReq_h"]
+                  /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, 
+                                  stack, src, dest, op_query, resp_query, 
+                                  sequencer, objects, obj, resp_c, op_c, 
+                                  succ_h, op_h, sender_h, op_t, resp_t, 
+                                  sender_t, prev, succ, op, resp, sender >>
 
-readingObj_h == /\ pc["head"] = "readingObj_h"
-                /\ IF isDirtyVersion(allObjLogs[head], op_h.obj)
-                      THEN /\ /\ dest' = [dest EXCEPT !["head"] = tail]
-                              /\ op_query' = [op_query EXCEPT !["head"] = op_h]
-                              /\ resp_query' = [resp_query EXCEPT !["head"] = resp_h]
-                              /\ src' = [src EXCEPT !["head"] = head]
-                              /\ stack' = [stack EXCEPT !["head"] = << [ procedure |->  "query",
-                                                                         pc        |->  "respondTorequester_h",
-                                                                         src       |->  src["head"],
-                                                                         dest      |->  dest["head"],
-                                                                         op_query  |->  op_query["head"],
-                                                                         resp_query |->  resp_query["head"] ] >>
-                                                                     \o stack["head"]]
-                           /\ pc' = [pc EXCEPT !["head"] = "sendQuery"]
-                           /\ UNCHANGED resp_h
-                      ELSE /\ resp_h' = readObjFromSelf(allObjLogs[head], op_h.obj)
-                           /\ pc' = [pc EXCEPT !["head"] = "respondTorequester_h"]
-                           /\ UNCHANGED << stack, src, dest, op_query, 
-                                           resp_query >>
-                /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, 
-                                sequencer, objects, obj, resp_c, op_c, succ_h, 
-                                op_h, requester_h, op_t, resp_t, requester_t, 
-                                prev, succ, op, resp, requester >>
-
-respondTorequester_h == /\ pc["head"] = "respondTorequester_h"
-                        /\ msgQs' = [msgQs EXCEPT ![(<<head, requester_h>>)] = Append(@, resp_h)]
-                        /\ pc' = [pc EXCEPT !["head"] = "listen_head"]
-                        /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, 
-                                        stack, src, dest, op_query, resp_query, 
-                                        sequencer, objects, obj, resp_c, op_c, 
-                                        succ_h, op_h, resp_h, requester_h, 
-                                        op_t, resp_t, requester_t, prev, succ, 
-                                        op, resp, requester >>
-
-dirtyWrite_h == /\ pc["head"] = "dirtyWrite_h"
-                /\ allObjLogs' = [allObjLogs EXCEPT ![head][(op_h.obj)] = Append(@, [uniqueId |-> (op_h.uniqueId), isDirty |-> TRUE])]
-                /\ pc' = [pc EXCEPT !["head"] = "propagate_h"]
-                /\ UNCHANGED << msgQs, clientOpSet, totalOrder, stack, src, 
-                                dest, op_query, resp_query, sequencer, objects, 
-                                obj, resp_c, op_c, succ_h, op_h, resp_h, 
-                                requester_h, op_t, resp_t, requester_t, prev, 
-                                succ, op, resp, requester >>
+replyToReadReq_h == /\ pc["head"] = "replyToReadReq_h"
+                    /\ msgQs' = [msgQs EXCEPT ![(<<head, sender_h>>)] = Append(@, resp_h)]
+                    /\ pc' = [pc EXCEPT !["head"] = "listen_h"]
+                    /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, stack, 
+                                    src, dest, op_query, resp_query, sequencer, 
+                                    objects, obj, resp_c, op_c, succ_h, op_h, 
+                                    resp_h, sender_h, op_t, resp_t, sender_t, 
+                                    prev, succ, op, resp, sender >>
 
 propagate_h == /\ pc["head"] = "propagate_h"
                /\ msgQs' = [msgQs EXCEPT ![(<<head, succ_h>>)] = Append(@, op_h)]
@@ -483,191 +555,136 @@ propagate_h == /\ pc["head"] = "propagate_h"
                /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, stack, src, 
                                dest, op_query, resp_query, sequencer, objects, 
                                obj, resp_c, op_c, succ_h, op_h, resp_h, 
-                               requester_h, op_t, resp_t, requester_t, prev, 
-                               succ, op, resp, requester >>
+                               sender_h, op_t, resp_t, sender_t, prev, succ, 
+                               op, resp, sender >>
 
 recvAck_h == /\ pc["head"] = "recvAck_h"
              /\ msgQs[(<<succ_h, head>>)] /= << >>
              /\ resp_h' = Head(msgQs[(<<succ_h, head>>)])
              /\ msgQs' = [msgQs EXCEPT ![(<<succ_h, head>>)] = Tail(@)]
-             /\ pc' = [pc EXCEPT !["head"] = "applyWrite_h"]
+             /\ allObjLogs' = [allObjLogs EXCEPT ![head][(op_h.obj)] = Append(Tail(@), [Head(@) EXCEPT !.isDirty = FALSE])]
+             /\ pc' = [pc EXCEPT !["head"] = "sendAck_h"]
+             /\ UNCHANGED << clientOpSet, totalOrder, stack, src, dest, 
+                             op_query, resp_query, sequencer, objects, obj, 
+                             resp_c, op_c, succ_h, op_h, sender_h, op_t, 
+                             resp_t, sender_t, prev, succ, op, resp, sender >>
+
+sendAck_h == /\ pc["head"] = "sendAck_h"
+             /\ msgQs' = [msgQs EXCEPT ![(<<head, sender_h>>)] = Append(@, ([   obj |-> op_h.obj,
+                                                                                uniqueId |-> op_h.uniqueId,
+                                                                                action |-> WRITE]))]
+             /\ pc' = [pc EXCEPT !["head"] = "listen_h"]
              /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, stack, src, 
                              dest, op_query, resp_query, sequencer, objects, 
-                             obj, resp_c, op_c, succ_h, op_h, requester_h, 
-                             op_t, resp_t, requester_t, prev, succ, op, resp, 
-                             requester >>
+                             obj, resp_c, op_c, succ_h, op_h, resp_h, sender_h, 
+                             op_t, resp_t, sender_t, prev, succ, op, resp, 
+                             sender >>
 
-applyWrite_h == /\ pc["head"] = "applyWrite_h"
-                /\ allObjLogs' = [allObjLogs EXCEPT ![head][(op_h.obj)] = Append(Tail(@), [Head(@) EXCEPT !.isDirty = TRUE])]
-                /\ pc' = [pc EXCEPT !["head"] = "ackSuccessfulWrite_h"]
-                /\ UNCHANGED << msgQs, clientOpSet, totalOrder, stack, src, 
-                                dest, op_query, resp_query, sequencer, objects, 
-                                obj, resp_c, op_c, succ_h, op_h, resp_h, 
-                                requester_h, op_t, resp_t, requester_t, prev, 
-                                succ, op, resp, requester >>
-
-ackSuccessfulWrite_h == /\ pc["head"] = "ackSuccessfulWrite_h"
-                        /\ resp_h' = [   obj |-> op_h.obj,
-                                         uniqueId |-> op_h.uniqueId,
-                                         action |-> TRUE]
-                        /\ msgQs' = [msgQs EXCEPT ![(<<head, requester_h>>)] = Append(@, resp_h')]
-                        /\ pc' = [pc EXCEPT !["head"] = "listen_head"]
-                        /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, 
-                                        stack, src, dest, op_query, resp_query, 
-                                        sequencer, objects, obj, resp_c, op_c, 
-                                        succ_h, op_h, requester_h, op_t, 
-                                        resp_t, requester_t, prev, succ, op, 
-                                        resp, requester >>
-
-headProcess == listen_head \/ incomingClientReq_h \/ readingObj_h
-                  \/ respondTorequester_h \/ dirtyWrite_h \/ propagate_h
-                  \/ recvAck_h \/ applyWrite_h \/ ackSuccessfulWrite_h
+headProcess == listen_h \/ incomingReq_h \/ checkDirty_h \/ apportion_h
+                  \/ readFromSelf_h \/ replyToReadReq_h \/ propagate_h
+                  \/ recvAck_h \/ sendAck_h
 
 listen_t == /\ pc["tail"] = "listen_t"
-            /\ \E temp \in {n \in PotentialRequestClients(tail) : msgQs[<<n, tail>>] /= << >>}:
-                 requester_t' = temp
+            /\ \E temp \in {s \in sendersTo(tail) : msgQs[<<s, tail>>] /= << >>}:
+                 sender_t' = temp
             /\ pc' = [pc EXCEPT !["tail"] = "incomingReq_t"]
             /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, stack, 
                             src, dest, op_query, resp_query, sequencer, 
                             objects, obj, resp_c, op_c, succ_h, op_h, resp_h, 
-                            requester_h, op_t, resp_t, prev, succ, op, resp, 
-                            requester >>
+                            sender_h, op_t, resp_t, prev, succ, op, resp, 
+                            sender >>
 
 incomingReq_t == /\ pc["tail"] = "incomingReq_t"
-                 /\ msgQs[(<<requester_t, tail>>)] /= << >>
-                 /\ op_t' = Head(msgQs[(<<requester_t, tail>>)])
-                 /\ msgQs' = [msgQs EXCEPT ![(<<requester_t, tail>>)] = Tail(@)]
+                 /\ msgQs[(<<sender_t, tail>>)] /= << >>
+                 /\ op_t' = Head(msgQs[(<<sender_t, tail>>)])
+                 /\ msgQs' = [msgQs EXCEPT ![(<<sender_t, tail>>)] = Tail(@)]
+                 /\ totalOrder' = [totalOrder EXCEPT ![op_t'.obj] = Append(@, op_t')]
                  /\ IF op_t'.action = READ
-                       THEN /\ pc' = [pc EXCEPT !["tail"] = "readObj_t"]
-                       ELSE /\ pc' = [pc EXCEPT !["tail"] = "applyWrite_t"]
-                 /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, stack, 
-                                 src, dest, op_query, resp_query, sequencer, 
-                                 objects, obj, resp_c, op_c, succ_h, op_h, 
-                                 resp_h, requester_h, resp_t, requester_t, 
-                                 prev, succ, op, resp, requester >>
+                       THEN /\ pc' = [pc EXCEPT !["tail"] = "replyToReadReq_t"]
+                            /\ UNCHANGED allObjLogs
+                       ELSE /\ allObjLogs' = [allObjLogs EXCEPT ![tail][op_t'.obj] = Append(@, [uniqueId |-> op_t'.uniqueId, isDirty |-> FALSE])]
+                            /\ pc' = [pc EXCEPT !["tail"] = "sendAck_t"]
+                 /\ UNCHANGED << clientOpSet, stack, src, dest, op_query, 
+                                 resp_query, sequencer, objects, obj, resp_c, 
+                                 op_c, succ_h, op_h, resp_h, sender_h, resp_t, 
+                                 sender_t, prev, succ, op, resp, sender >>
 
-readObj_t == /\ pc["tail"] = "readObj_t"
-             /\ resp_t' = readObjFromSelf(allObjLogs[tail], op_t.obj)
-             /\ pc' = [pc EXCEPT !["tail"] = "respond_t"]
-             /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, stack, 
-                             src, dest, op_query, resp_query, sequencer, 
-                             objects, obj, resp_c, op_c, succ_h, op_h, resp_h, 
-                             requester_h, op_t, requester_t, prev, succ, op, 
-                             resp, requester >>
+replyToReadReq_t == /\ pc["tail"] = "replyToReadReq_t"
+                    /\ resp_t' = read(allObjLogs[tail], op_t.obj)
+                    /\ msgQs' = [msgQs EXCEPT ![(<<tail, sender_t>>)] = Append(@, resp_t')]
+                    /\ pc' = [pc EXCEPT !["tail"] = "listen_t"]
+                    /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, stack, 
+                                    src, dest, op_query, resp_query, sequencer, 
+                                    objects, obj, resp_c, op_c, succ_h, op_h, 
+                                    resp_h, sender_h, op_t, sender_t, prev, 
+                                    succ, op, resp, sender >>
 
-respond_t == /\ pc["tail"] = "respond_t"
-             /\ msgQs' = [msgQs EXCEPT ![(<<tail, requester_t>>)] = Append(@, resp_t)]
-             /\ pc' = [pc EXCEPT !["tail"] = "totallyOrder"]
+sendAck_t == /\ pc["tail"] = "sendAck_t"
+             /\ msgQs' = [msgQs EXCEPT ![(<<tail, sender_t>>)] = Append(@, ([    obj |-> op_t.obj,
+                                                                                    uniqueId |-> op_t.uniqueId,
+                                                                                    action |-> WRITE]))]
+             /\ pc' = [pc EXCEPT !["tail"] = "listen_t"]
              /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, stack, src, 
                              dest, op_query, resp_query, sequencer, objects, 
-                             obj, resp_c, op_c, succ_h, op_h, resp_h, 
-                             requester_h, op_t, resp_t, requester_t, prev, 
-                             succ, op, resp, requester >>
+                             obj, resp_c, op_c, succ_h, op_h, resp_h, sender_h, 
+                             op_t, resp_t, sender_t, prev, succ, op, resp, 
+                             sender >>
 
-applyWrite_t == /\ pc["tail"] = "applyWrite_t"
-                /\ allObjLogs' = [allObjLogs EXCEPT ![tail][op_t.obj] =                   Append(allObjLogs[tail][op_t.obj],
-                                                                        [uniqueId |-> op_t.uniqueId, isDirty |-> FALSE])]
-                /\ pc' = [pc EXCEPT !["tail"] = "ackSuccessfulWrite_t"]
-                /\ UNCHANGED << msgQs, clientOpSet, totalOrder, stack, src, 
-                                dest, op_query, resp_query, sequencer, objects, 
-                                obj, resp_c, op_c, succ_h, op_h, resp_h, 
-                                requester_h, op_t, resp_t, requester_t, prev, 
-                                succ, op, resp, requester >>
-
-ackSuccessfulWrite_t == /\ pc["tail"] = "ackSuccessfulWrite_t"
-                        /\ resp_t' = [  obj |-> op_t.obj,
-                                     uniqueId |-> op_t.uniqueId,
-                                     action |-> TRUE]
-                        /\ msgQs' = [msgQs EXCEPT ![(<<tail, requester_t>>)] = Append(@, resp_t')]
-                        /\ pc' = [pc EXCEPT !["tail"] = "totallyOrder"]
-                        /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, 
-                                        stack, src, dest, op_query, resp_query, 
-                                        sequencer, objects, obj, resp_c, op_c, 
-                                        succ_h, op_h, resp_h, requester_h, 
-                                        op_t, requester_t, prev, succ, op, 
-                                        resp, requester >>
-
-totallyOrder == /\ pc["tail"] = "totallyOrder"
-                /\ totalOrder' = [totalOrder EXCEPT ![op_t.obj] = Append(@, op_t)]
-                /\ pc' = [pc EXCEPT !["tail"] = "listen_t"]
-                /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, stack, src, 
-                                dest, op_query, resp_query, sequencer, objects, 
-                                obj, resp_c, op_c, succ_h, op_h, resp_h, 
-                                requester_h, op_t, resp_t, requester_t, prev, 
-                                succ, op, resp, requester >>
-
-tailProcess == listen_t \/ incomingReq_t \/ readObj_t \/ respond_t
-                  \/ applyWrite_t \/ ackSuccessfulWrite_t \/ totallyOrder
+tailProcess == listen_t \/ incomingReq_t \/ replyToReadReq_t \/ sendAck_t
 
 listen(self) == /\ pc[self] = "listen"
-                /\ \E temp \in {n \in PotentialRequestClients(self) : msgQs[<<n, self>>] /= << >>}:
-                     requester' = [requester EXCEPT ![self] = temp]
+                /\ \E temp \in {n \in sendersTo(self) : msgQs[<<n, self>>] /= << >>}:
+                     sender' = [sender EXCEPT ![self] = temp]
                 /\ pc' = [pc EXCEPT ![self] = "incomingReq"]
                 /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, 
                                 stack, src, dest, op_query, resp_query, 
                                 sequencer, objects, obj, resp_c, op_c, succ_h, 
-                                op_h, resp_h, requester_h, op_t, resp_t, 
-                                requester_t, prev, succ, op, resp >>
+                                op_h, resp_h, sender_h, op_t, resp_t, sender_t, 
+                                prev, succ, op, resp >>
 
 incomingReq(self) == /\ pc[self] = "incomingReq"
-                     /\ msgQs[(<<requester[self], self>>)] /= << >>
-                     /\ op' = [op EXCEPT ![self] = Head(msgQs[(<<requester[self], self>>)])]
-                     /\ msgQs' = [msgQs EXCEPT ![(<<requester[self], self>>)] = Tail(@)]
+                     /\ msgQs[(<<sender[self], self>>)] /= << >>
+                     /\ op' = [op EXCEPT ![self] = Head(msgQs[(<<sender[self], self>>)])]
+                     /\ msgQs' = [msgQs EXCEPT ![(<<sender[self], self>>)] = Tail(@)]
                      /\ IF op'[self].action = READ
-                           THEN /\ pc' = [pc EXCEPT ![self] = "readingObj"]
-                           ELSE /\ pc' = [pc EXCEPT ![self] = "dirtyWrite"]
-                     /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, 
-                                     stack, src, dest, op_query, resp_query, 
-                                     sequencer, objects, obj, resp_c, op_c, 
-                                     succ_h, op_h, resp_h, requester_h, op_t, 
-                                     resp_t, requester_t, prev, succ, resp, 
-                                     requester >>
+                           THEN /\ IF isDirtyVersion(allObjLogs[self], op'[self].obj)
+                                      THEN /\ /\ dest' = [dest EXCEPT ![self] = tail]
+                                              /\ op_query' = [op_query EXCEPT ![self] = op'[self]]
+                                              /\ resp_query' = [resp_query EXCEPT ![self] = resp[self]]
+                                              /\ src' = [src EXCEPT ![self] = self]
+                                              /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "query",
+                                                                                       pc        |->  "replyToReadReq",
+                                                                                       src       |->  src[self],
+                                                                                       dest      |->  dest[self],
+                                                                                       op_query  |->  op_query[self],
+                                                                                       resp_query |->  resp_query[self] ] >>
+                                                                                   \o stack[self]]
+                                           /\ pc' = [pc EXCEPT ![self] = "sendQuery"]
+                                           /\ resp' = resp
+                                      ELSE /\ resp' = [resp EXCEPT ![self] = read(allObjLogs[self], op'[self].obj)]
+                                           /\ pc' = [pc EXCEPT ![self] = "replyToReadReq"]
+                                           /\ UNCHANGED << stack, src, dest, 
+                                                           op_query, 
+                                                           resp_query >>
+                                /\ UNCHANGED allObjLogs
+                           ELSE /\ allObjLogs' = [allObjLogs EXCEPT ![self][(op'[self].obj)] = Append(@, [uniqueId |-> (op'[self].uniqueId), isDirty |-> TRUE])]
+                                /\ pc' = [pc EXCEPT ![self] = "propagate"]
+                                /\ UNCHANGED << stack, src, dest, op_query, 
+                                                resp_query, resp >>
+                     /\ UNCHANGED << clientOpSet, totalOrder, sequencer, 
+                                     objects, obj, resp_c, op_c, succ_h, op_h, 
+                                     resp_h, sender_h, op_t, resp_t, sender_t, 
+                                     prev, succ, sender >>
 
-readingObj(self) == /\ pc[self] = "readingObj"
-                    /\ IF isDirtyVersion(allObjLogs[self], op[self].obj)
-                          THEN /\ /\ dest' = [dest EXCEPT ![self] = tail]
-                                  /\ op_query' = [op_query EXCEPT ![self] = op[self]]
-                                  /\ resp_query' = [resp_query EXCEPT ![self] = resp[self]]
-                                  /\ src' = [src EXCEPT ![self] = self]
-                                  /\ stack' = [stack EXCEPT ![self] = << [ procedure |->  "query",
-                                                                           pc        |->  "respondToClient",
-                                                                           src       |->  src[self],
-                                                                           dest      |->  dest[self],
-                                                                           op_query  |->  op_query[self],
-                                                                           resp_query |->  resp_query[self] ] >>
-                                                                       \o stack[self]]
-                               /\ pc' = [pc EXCEPT ![self] = "sendQuery"]
-                               /\ resp' = resp
-                          ELSE /\ resp' = [resp EXCEPT ![self] = readObjFromSelf(allObjLogs[self], op[self].obj)]
-                               /\ pc' = [pc EXCEPT ![self] = "respondToClient"]
-                               /\ UNCHANGED << stack, src, dest, op_query, 
-                                               resp_query >>
-                    /\ UNCHANGED << msgQs, allObjLogs, clientOpSet, totalOrder, 
-                                    sequencer, objects, obj, resp_c, op_c, 
-                                    succ_h, op_h, resp_h, requester_h, op_t, 
-                                    resp_t, requester_t, prev, succ, op, 
-                                    requester >>
-
-respondToClient(self) == /\ pc[self] = "respondToClient"
-                         /\ msgQs' = [msgQs EXCEPT ![(<<self, requester[self]>>)] = Append(@, resp[self])]
-                         /\ pc' = [pc EXCEPT ![self] = "listen"]
-                         /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, 
-                                         stack, src, dest, op_query, 
-                                         resp_query, sequencer, objects, obj, 
-                                         resp_c, op_c, succ_h, op_h, resp_h, 
-                                         requester_h, op_t, resp_t, 
-                                         requester_t, prev, succ, op, resp, 
-                                         requester >>
-
-dirtyWrite(self) == /\ pc[self] = "dirtyWrite"
-                    /\ allObjLogs' = [allObjLogs EXCEPT ![self][(op[self].obj)] = Append(@, [uniqueId |-> (op[self].uniqueId), isDirty |-> TRUE])]
-                    /\ pc' = [pc EXCEPT ![self] = "propagate"]
-                    /\ UNCHANGED << msgQs, clientOpSet, totalOrder, stack, src, 
-                                    dest, op_query, resp_query, sequencer, 
-                                    objects, obj, resp_c, op_c, succ_h, op_h, 
-                                    resp_h, requester_h, op_t, resp_t, 
-                                    requester_t, prev, succ, op, resp, 
-                                    requester >>
+replyToReadReq(self) == /\ pc[self] = "replyToReadReq"
+                        /\ msgQs' = [msgQs EXCEPT ![(<<self, sender[self]>>)] = Append(@, resp[self])]
+                        /\ pc' = [pc EXCEPT ![self] = "listen"]
+                        /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, 
+                                        stack, src, dest, op_query, resp_query, 
+                                        sequencer, objects, obj, resp_c, op_c, 
+                                        succ_h, op_h, resp_h, sender_h, op_t, 
+                                        resp_t, sender_t, prev, succ, op, resp, 
+                                        sender >>
 
 propagate(self) == /\ pc[self] = "propagate"
                    /\ msgQs' = [msgQs EXCEPT ![(<<self, succ[self]>>)] = Append(@, op[self])]
@@ -675,49 +692,34 @@ propagate(self) == /\ pc[self] = "propagate"
                    /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, stack, 
                                    src, dest, op_query, resp_query, sequencer, 
                                    objects, obj, resp_c, op_c, succ_h, op_h, 
-                                   resp_h, requester_h, op_t, resp_t, 
-                                   requester_t, prev, succ, op, resp, 
-                                   requester >>
+                                   resp_h, sender_h, op_t, resp_t, sender_t, 
+                                   prev, succ, op, resp, sender >>
 
 recvAck(self) == /\ pc[self] = "recvAck"
                  /\ msgQs[(<<succ[self], self>>)] /= << >>
                  /\ resp' = [resp EXCEPT ![self] = Head(msgQs[(<<succ[self], self>>)])]
                  /\ msgQs' = [msgQs EXCEPT ![(<<succ[self], self>>)] = Tail(@)]
-                 /\ pc' = [pc EXCEPT ![self] = "applyWrite"]
+                 /\ pc' = [pc EXCEPT ![self] = "sendAck"]
                  /\ UNCHANGED << allObjLogs, clientOpSet, totalOrder, stack, 
                                  src, dest, op_query, resp_query, sequencer, 
                                  objects, obj, resp_c, op_c, succ_h, op_h, 
-                                 resp_h, requester_h, op_t, resp_t, 
-                                 requester_t, prev, succ, op, requester >>
+                                 resp_h, sender_h, op_t, resp_t, sender_t, 
+                                 prev, succ, op, sender >>
 
-applyWrite(self) == /\ pc[self] = "applyWrite"
-                    /\ allObjLogs' = [allObjLogs EXCEPT ![self][(op[self].obj)] = Append(Tail(@), [Head(@) EXCEPT !.isDirty = TRUE])]
-                    /\ pc' = [pc EXCEPT ![self] = "ackSuccessfulWrite"]
-                    /\ UNCHANGED << msgQs, clientOpSet, totalOrder, stack, src, 
-                                    dest, op_query, resp_query, sequencer, 
-                                    objects, obj, resp_c, op_c, succ_h, op_h, 
-                                    resp_h, requester_h, op_t, resp_t, 
-                                    requester_t, prev, succ, op, resp, 
-                                    requester >>
+sendAck(self) == /\ pc[self] = "sendAck"
+                 /\ allObjLogs' = [allObjLogs EXCEPT ![self][(op[self].obj)] = Append(Tail(@), [Head(@) EXCEPT !.isDirty = FALSE])]
+                 /\ msgQs' = [msgQs EXCEPT ![(<<self, prev[self]>>)] = Append(@, ([  obj |-> op[self].obj,
+                                                                                             uniqueId |-> op[self].uniqueId,
+                                                                                             action |-> WRITE]))]
+                 /\ pc' = [pc EXCEPT ![self] = "listen"]
+                 /\ UNCHANGED << clientOpSet, totalOrder, stack, src, dest, 
+                                 op_query, resp_query, sequencer, objects, obj, 
+                                 resp_c, op_c, succ_h, op_h, resp_h, sender_h, 
+                                 op_t, resp_t, sender_t, prev, succ, op, resp, 
+                                 sender >>
 
-ackSuccessfulWrite(self) == /\ pc[self] = "ackSuccessfulWrite"
-                            /\ resp' = [resp EXCEPT ![self] = [   obj |-> op[self].obj,
-                                                                  uniqueId |-> op[self].uniqueId,
-                                                                  action |-> TRUE]]
-                            /\ msgQs' = [msgQs EXCEPT ![(<<self, prev[self]>>)] = Append(@, resp'[self])]
-                            /\ pc' = [pc EXCEPT ![self] = "listen"]
-                            /\ UNCHANGED << allObjLogs, clientOpSet, 
-                                            totalOrder, stack, src, dest, 
-                                            op_query, resp_query, sequencer, 
-                                            objects, obj, resp_c, op_c, succ_h, 
-                                            op_h, resp_h, requester_h, op_t, 
-                                            resp_t, requester_t, prev, succ, 
-                                            op, requester >>
-
-n(self) == listen(self) \/ incomingReq(self) \/ readingObj(self)
-              \/ respondToClient(self) \/ dirtyWrite(self)
-              \/ propagate(self) \/ recvAck(self) \/ applyWrite(self)
-              \/ ackSuccessfulWrite(self)
+n(self) == listen(self) \/ incomingReq(self) \/ replyToReadReq(self)
+              \/ propagate(self) \/ recvAck(self) \/ sendAck(self)
 
 Next == headProcess \/ tailProcess
            \/ (\E self \in ProcSet: query(self))
@@ -737,21 +739,22 @@ Spec == /\ Init /\ [][Next]_vars
 
 
 
+
 TypeInvariant  ==   /\ msgQs        \in [Network -> {<< >>} \cup Seq(OperationType)]
-                    /\ allObjLogs   \in [Nodes -> [Objects -> {<< >>} \cup Seq(LogEntryType)]]
-                    /\ totalOrder   \in [Objects -> {<< >>} \cup Seq(OperationType)]
-                    /\ succ_h       = Successors[head]
-                    /\ op_h         \in OperationType
-                    /\ resp_h       \in OperationType
-                    /\ requester_h  \in Clients
-                    /\ succ         \in [Nodes \ {head, tail} -> Nodes \ {head}]
-                    /\ prev         \in [Nodes \ {head, tail} -> Nodes \ {tail}]
-                    /\ op           \in [Nodes \ {head, tail} -> OperationType]
-                    /\ resp         \in [Nodes \ {head, tail} -> OperationType]
-                    /\ requester    \in [Nodes \ {head, tail} -> Clients \cup (Nodes \ {tail})]   
-                    /\ resp_t       \in OperationType
-                    /\ op_t         \in OperationType
-                    /\ requester_t  \in Clients \cup (Nodes \ {tail})
+\*                    /\ allObjLogs   \in [Nodes -> [Objects -> {<< >>} \cup Seq(LogEntryType)]]
+\*                    /\ totalOrder   \in [Objects -> {<< >>} \cup Seq(OperationType)]
+\*                    /\ succ_h       = Successors[head]
+\*                    /\ op_h         \in OperationType
+\*                    /\ resp_h       \in OperationType
+\*                    /\ sender_h     \in Clients
+\*                    /\ succ         \in [Nodes \ {head, tail} -> Nodes \ {head}]
+\*                    /\ prev         \in [Nodes \ {head, tail} -> Nodes \ {tail}]
+\*                    /\ op           \in [Nodes \ {head, tail} -> OperationType]
+\*                    /\ resp         \in [Nodes \ {head, tail} -> OperationType]
+\*                    /\ sender       \in [Nodes \ {head, tail} -> Clients \cup (Nodes \ {tail})]   
+\*                    /\ resp_t       \in OperationType
+\*                    /\ op_t         \in OperationType
+\*                    /\ sender_t     \in Clients \cup (Nodes \ {tail})
                     
 
 RECURSIVE clean(_)
@@ -771,8 +774,6 @@ PostCondition == \A node \in Nodes \ {tail}: \A o \in Objects :
 \*                        THEN set 
 \*                        ELSE SeqToSet(Tail(seq), set \cup {Head(seq)})  
 \*unorderedOpsByObj == [o \in Objects |-> SeqToSet(totalOrder[o], {})]
-
-Map(s, f(_)) == [i \in s |-> f(i)]
 
 RECURSIVE ReduceSeq(_, _, _)
 ReduceSeq(seq, f(_, _), e) == IF seq = << >> THEN e 
@@ -796,11 +797,10 @@ IsPrefix(prefixParam, logParam) == LET prefix == clean(prefixParam)
                                                                     [] log = << >> -> FALSE
                                                                     [] OTHER -> SubSeq(log, 1, Len(prefix)) = prefix
   
-
 PrefixInvariant == \A node \in Nodes \ {tail}: \A o \in Objects: 
                         LET successor == Successors[node] IN IsPrefix(allObjLogs[node][o], allObjLogs[succ][o])
 =============================================================================
 \* Modification History
-\* Last modified Sun Jun 04 01:30:30 EDT 2023 by jenniferlam
+\* Last modified Sun Jun 04 21:39:37 EDT 2023 by jenniferlam
 \* Last modified Fri Jun 02 18:58:13 EDT 2023 by 72jen
 \* Created Thu May 25 11:58:00 EDT 2023 by jenniferlam
