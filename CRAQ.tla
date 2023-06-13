@@ -741,20 +741,20 @@ Spec == /\ Init /\ [][Next]_vars
 
 
 TypeInvariant  ==   /\ msgQs        \in [Network -> {<< >>} \cup Seq(OperationType)]
-\*                    /\ allObjLogs   \in [Nodes -> [Objects -> {<< >>} \cup Seq(LogEntryType)]]
-\*                    /\ totalOrder   \in [Objects -> {<< >>} \cup Seq(OperationType)]
-\*                    /\ succ_h       = Successors[head]
-\*                    /\ op_h         \in OperationType
-\*                    /\ resp_h       \in OperationType
-\*                    /\ sender_h     \in Clients
-\*                    /\ succ         \in [Nodes \ {head, tail} -> Nodes \ {head}]
-\*                    /\ prev         \in [Nodes \ {head, tail} -> Nodes \ {tail}]
-\*                    /\ op           \in [Nodes \ {head, tail} -> OperationType]
-\*                    /\ resp         \in [Nodes \ {head, tail} -> OperationType]
-\*                    /\ sender       \in [Nodes \ {head, tail} -> Clients \cup (Nodes \ {tail})]   
-\*                    /\ resp_t       \in OperationType
-\*                    /\ op_t         \in OperationType
-\*                    /\ sender_t     \in Clients \cup (Nodes \ {tail})
+                    /\ allObjLogs   \in [Nodes -> [Objects -> {<< >>} \cup Seq(LogEntryType)]]
+                    /\ totalOrder   \in [Objects -> {<< >>} \cup Seq(OperationType)]
+                    /\ succ_h       = Successors[head]
+                    /\ op_h         \in OperationType
+                    /\ resp_h       \in OperationType
+                    /\ sender_h     \in Clients
+                    /\ succ         \in [Nodes \ {head, tail} -> Nodes \ {head}]
+                    /\ prev         \in [Nodes \ {head, tail} -> Nodes \ {tail}]
+                    /\ op           \in [Nodes \ {head, tail} -> OperationType]
+                    /\ resp         \in [Nodes \ {head, tail} -> OperationType]
+                    /\ sender       \in [Nodes \ {head, tail} -> Clients \cup (Nodes \ {tail})]   
+                    /\ resp_t       \in OperationType
+                    /\ op_t         \in OperationType
+                    /\ sender_t     \in Clients \cup (Nodes \ {tail})
                     
 
 RECURSIVE clean(_)
@@ -767,13 +767,6 @@ Terminated == \A o \in Objects : LET headLog == allObjLogs[head][o]
 PostCondition == \A node \in Nodes \ {tail}: \A o \in Objects : 
                     LET log == allObjLogs[node][o]
                         tailLog == allObjLogs[tail][o] IN log = tailLog
-                  
-                  
-\*RECURSIVE SeqToSet(_, _)
-\*SeqToSet(seq, set) == IF seq = << >> 
-\*                        THEN set 
-\*                        ELSE SeqToSet(Tail(seq), set \cup {Head(seq)})  
-\*unorderedOpsByObj == [o \in Objects |-> SeqToSet(totalOrder[o], {})]
 
 RECURSIVE ReduceSeq(_, _, _)
 ReduceSeq(seq, f(_, _), e) == IF seq = << >> THEN e 
@@ -801,6 +794,6 @@ PrefixInvariant == \A node \in Nodes \ {tail}: \A o \in Objects:
                         LET successor == Successors[node] IN IsPrefix(allObjLogs[node][o], allObjLogs[succ][o])
 =============================================================================
 \* Modification History
-\* Last modified Sun Jun 04 21:39:37 EDT 2023 by jenniferlam
+\* Last modified Tue Jun 13 12:56:18 EDT 2023 by jenniferlam
 \* Last modified Fri Jun 02 18:58:13 EDT 2023 by 72jen
 \* Created Thu May 25 11:58:00 EDT 2023 by jenniferlam
