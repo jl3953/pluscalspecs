@@ -27,6 +27,7 @@ ClientEdges == EdgesFromClients \cup EdgesToClients
 Network == Edges \cup ClientEdges
 
 UniqueIdType == {<<c, id>> : c \in Clients, id \in 0..NumMsgs}
+SendersTo(n) == {edge[1]: edge \in {e \in Network: e[2] = n}}
 
 ASSUME  /\ head \in Nodes
         /\ tail \in Nodes
@@ -96,28 +97,33 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         
         IsDirty(node, obj) == Head(objLogs[node][obj]).commitStatus = DIRTY
         
-        NullReq == CHOOSE r : r \notin RequestType
-        NullNode == CHOOSE n : n \notin Nodes
-        NullTs == CHOOSE ts : ts \notin TimestampType
-        NullUniqueId == CHOOSE id : id \notin UniqueIdType
-        NullCommitStatus == CHOOSE status : status \notin CommitType
+\*        NullReq == CHOOSE r : r \notin RequestType
+\*        NullNode == CHOOSE n : n \notin Nodes
+\*        NullTs == CHOOSE ts : ts \notin TimestampType
+\*        NullUniqueId == CHOOSE id : id \notin UniqueIdType
+\*        NullCommitStatus == CHOOSE status : status \notin CommitType
+        
+        NullReq == CHOOSE r \in RequestType: TRUE
+        NullNode == CHOOSE n \in Nodes : TRUE
+        NullTs == CHOOSE ts \in TimestampType : TRUE
+        NullUniqueId == CHOOSE id \in UniqueIdType: TRUE
+        NullCommitStatus == CHOOSE status \in CommitType : TRUE
         
         Read(node, obj) == Head(objLogs[node][obj])
-        Find(set, k) == CHOOSE kv \in set: kv[1] = k
-        SendersTo(n) == {\A edge \in Network: edge[2] = n}
-        Now == timeOracle
+        FindPair(set, k) == CHOOSE kv \in set: kv[1] = k
+        Find(set, k) == LET kv == FindPair(set, k) IN kv[2]
         
     }
     
     \* macro definitions
     macro send(sender, receiver, msg) {
-        msgQs[sender, receiver] := Append(@, msg)
+        msgQs[<<sender, receiver>>] := Append(@, msg)
     }
     
     macro recv(sender, receiver, msg) {
-        when msgQs[<<sender, receiver>>] /= << >>;
-        msg := Head(msgQs[sender, receiver]);
-        msgQs := Tail(msgQs);
+\*        when msgQs[<<sender, receiver>>] /= << >>;
+        msg := Head(msgQs[<<sender, receiver>>]);
+        msgQs[<<sender, receiver>>] := Tail(@);
     }
     
     macro add(set, k, v) {
@@ -125,7 +131,7 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
     }
     
     macro remove(set, k) {
-        set := @ \ {CHOOSE kv \in set : kv[1] = k};
+        set := set \ {FindPair(set, k)};
     }
     macro find(set, k, v) {
         v := CHOOSE kv \in set: kv[1] = k;
@@ -138,20 +144,19 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         objLogs[node][objVer.obj] := Cons(objVer, @);
     }
     
-    fair process(time="timeOracle") {
-        oracle: 
-        while (TRUE) {
-            increment: timeOracle := timeOracle + 1;
-        }
-    }
+\*    
+\*    fair process(time="timeOracle") {
+\*        oracle: 
+\*        while (TRUE) {
+\*            timeOracle := timeOracle + 1;
+\*        }
+\*    }
     
     fair process(c \in Clients)
         variables   uniqueId = <<self, 1>>,
                     msg = NullReq,
-                    gateway = NullNode,
-                    null = << >>;
+                    gateway = NullNode;
     {
-    
         clientWrite: 
         send(self, head, [  callType |-> WRITE_INV,
                             uniqueId |-> uniqueId,
@@ -161,10 +166,10 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                                     commitTs |-> NullTs,
                                     commitStatus |-> NullCommitStatus]]);
                                     
-        waitForIt: with (temp \in {s \in SendersTo(self): msgQs[<<s, self>>] /= << >>}) {
+        recvdWriteResp: with (temp \in {s \in SendersTo(self): msgQs[<<s, self>>] /= << >>}) {
             gateway := temp;
         };
-        recvdWriteResp: recv(gateway, self, msg); 
+        recv(gateway, self, msg); 
         assert(msg.uniqueId = uniqueId);
         assert(msg.callType = WRITE_RESP);
         
@@ -178,28 +183,94 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                                         commitTs |-> NullTs,
                                         commitStatus |-> NullCommitStatus]]);
                                         
-        with (temp \in {node \in SendersTo(self) : msgQs[node, self] /= << >>}) {
-            gateway := temp
+        recvdReadResp: with (temp \in {node \in SendersTo(self) : msgQs[node, self] /= << >>}) {
+            gateway := temp;
         }; 
-        recvdReadResp: recv(gateway, self, msg);
+        recv(gateway, self, msg);
         assert(msg.uniqueId = uniqueId);
-        assert(msg.CallType = READ_RESP);
+        assert(msg.callType = READ_RESP);
     }
     
-    fair process(n \in Nodes)
+    fair process(he="head") 
+        variables req_h = NullReq,
+                  sender_h = NullNode,
+                  pendingInvos_h = {};
+    {
+        listen_h: while (TRUE) {
+            with (temp \in {s \in SendersTo(head): msgQs[<<s, head>>] /= << >>}) {
+                sender_h := temp;
+            }; 
+            
+            incomingMsg_h: recv(sender_h, head, req_h);
+            
+            if (req_h.callType = READ_INV) {
+                if (IsDirty(head, req_h.op.obj)) {
+                    apportionQ: send(head, tail, req_h);
+                    add(pendingInvos_h, req_h.uniqueId, sender);
+                } else {
+                    respFromHead: send(head, sender_h, [    callType |-> READ_RESP,
+                                                            uniqueId |-> req_h.uniqueId,
+                                                            op |-> Read(head, req_h.op.obj)]);
+                }
+            } else {
+                if (req_h.callType = READ_RESP) {
+                    fwdFromTail_h: send(head, Find(pendingInvos_h, req_h.uniqueId), req_h);
+                    remove(pendingInvos_h, req_h.uniqueId);
+                } else {
+                    if (req_h.callType = WRITE_INV) {
+                        write(head, [req_h.op EXCEPT    !.startTs = NullTs, 
+                                                        !.commitStatus = DIRTY]);
+\*                        incrementTime_h: timeOracle := timeOracle + 1;
+                        propagate_h: send(head, Successors[head], req_h);
+                        add(pendingInvos_h, req_h.uniqueId, sender_h);
+                    } else { \* WRITE_RESP
+                        objLogs[head][req_h.op.obj] := CommitDirtyVersion(@, req_h.uniqueId);
+                        respToClient: send(head, Find(pendingInvos_h, req_h.uniqueId), req_h);
+                        remove(pendingInvos_h, req_h.uniqueId);
+                    }
+                }
+            }
+        }
+    }
+    
+    fair process(ta="tail")
+        variables   req_t = NullReq,
+                    sender_t = NullNode,
+                    pendingInvos_t = {};
+    {
+        listen_t: while (TRUE) {
+            with (temp \in {s \in SendersTo(tail) : msgQs[<<s, tail>>] /= << >>}) {
+                sender_t := temp;
+            };
+            
+            incomingMsg_t: recv(sender_t, tail, req_t); 
+            if (req_t.callType = READ_INV) {
+                respFromSelf_t: send(tail, sender_t, [  callType |-> READ_RESP,
+                                                        uniqueId |-> req_t.uniqueId,
+                                                        op |-> Read(tail, req_t.op.obj)]);
+            } else { \* WRITE_INV
+                write(tail, [req_t.op EXCEPT  !.commitTs = NullTs, 
+                                              !.commitStatus = CLEAN]);
+\*                incrementTime_t: timeOracle := timeOracle + 1;
+                tailAck: send(tail, Predecessors[tail], [   callType |-> WRITE_RESP,
+                                                            uniqueId |-> req_t.uniqueId,
+                                                            op |-> Read(tail, req_t.op.obj)]);   
+            }
+        }
+    }
+    
+    fair process(n \in Nodes \ {head, tail})
         variables   req = NullReq,
                     sender = NullNode, 
                     pendingInvos = {};
     {
         listen: while (TRUE) {
-            waitForIt2: with (temp \in {s \in SendersTo(self) : msgQs[<<s, self>>] /= << >>}) {
+            with (temp \in {s \in SendersTo(self) : msgQs[<<s, self>>] /= << >>}) {
                 sender := temp;
             };
             
-            incomingMsg:
-            recv(sender, self, req); 
+            incomingMsg: recv(sender, self, req); 
             
-            readInv: 
             if (req.callType = READ_INV) {
                 if (IsDirty(self, req.op.obj)) {                 
                     apportionQ: send(self, tail, req);
@@ -209,45 +280,31 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                                                         uniqueId |-> req.uniqueId,
                                                         op |-> Read(self, req.op.obj)]);
                 } 
-            };             
-            readResp: 
-            if (req.callType = READ_RESP) {
-                fwdFromTail: send(self, Find(pendingInvos, req.uniqueId), req);
-                remove(pendingInvos, req.uniqueId);
-            }; 
-            writeInv: 
-            if (req.callType = WRITE_INV) {
-                if (self = tail) {
-                    write(self, [req.op EXCEPT  !.commitTs = Now, 
-                                                !.commitStatus = CLEAN]);
-                    tailAck: send(self, Predecessors[self], [   callType |-> WRITE_RESP,
-                                                                uniqueId |-> req.uniqueId,
-                                                                op |-> Read(self, req.op.obj)]);   
-                            
-                            
-                } else {
-                    if (self = head) {
-                        write(self, [req.op EXCEPT  !.startTs = Now, 
-                                                    !.commitStatus = DIRTY]);
-                    } else {
+            } else {
+                if (req.callType = READ_RESP) {
+                    fwdFromTail: send(self, Find(pendingInvos, req.uniqueId), req);
+                    remove(pendingInvos, req.uniqueId);
+                } else { 
+                    if (req.callType = WRITE_INV) {
                         write(self, req.op);
+                        
+                        propagate: send(self, Successors[self], req);
+                        add(pendingInvos, req.uniqueId, sender)
+                    } else { \* WRITE_RESP
+                        objLogs[self][req.op.obj] := CommitDirtyVersion(@, req.uniqueId);
+                        
+                        backProp: send(self, Find(pendingInvos, req.uniqueId), req);
+                        remove(pendingInvos, req.uniqueId);
                     };
-                    propagate: send(self, Successors[self], req);
-                    add(pendingInvos, req.uniqueId, sender);
                 }
-            };            
-            writeResp: 
-            if (req.callType = WRITE_RESP) {
-                objLogs[self][req.op.obj] := CommitDirtyVersion(@, req.uniqueId);
-                backProp: send(self, Find(pendingInvos, req.uniqueId), req);
-                remove(pendingInvos, req.uniqueId);
-            };  
+            }  
         }
     }
 }
 
 ****************************************************************************)
-\* BEGIN TRANSLATION (chksum(pcal) = "98975a8a" /\ chksum(tla) = "c989005")
+\* BEGIN TRANSLATION (chksum(pcal) = "f67d21c6" /\ chksum(tla) = "70c88750")
+\* Label apportionQ of process he at line 120 col 9 changed to apportionQ_
 VARIABLES msgQs, objLogs, timeOracle, pc
 
 (* define statement *)
@@ -262,23 +319,30 @@ CommitDirtyVersion(objLog, uniqueId) == LET mostRecentVer == Head(objLog) IN
 
 IsDirty(node, obj) == Head(objLogs[node][obj]).commitStatus = DIRTY
 
-NullReq == CHOOSE r : r \notin RequestType
-NullNode == CHOOSE n : n \notin Nodes
-NullTs == CHOOSE ts : ts \notin TimestampType
-NullUniqueId == CHOOSE id : id \notin UniqueIdType
-NullCommitStatus == CHOOSE status : status \notin CommitType
+
+
+
+
+
+
+NullReq == CHOOSE r \in RequestType: TRUE
+NullNode == CHOOSE n \in Nodes : TRUE
+NullTs == CHOOSE ts \in TimestampType : TRUE
+NullUniqueId == CHOOSE id \in UniqueIdType: TRUE
+NullCommitStatus == CHOOSE status \in CommitType : TRUE
 
 Read(node, obj) == Head(objLogs[node][obj])
-Find(set, k) == CHOOSE kv \in set: kv[1] = k
-SendersTo(n) == {\A edge \in Network: edge[2] = n}
-Now == timeOracle
+FindPair(set, k) == CHOOSE kv \in set: kv[1] = k
+Find(set, k) == LET kv == FindPair(set, k) IN kv[2]
 
-VARIABLES uniqueId, msg, gateway, null, req, sender, pendingInvos
+VARIABLES uniqueId, msg, gateway, req_h, sender_h, pendingInvos_h, req_t, 
+          sender_t, pendingInvos_t, req, sender, pendingInvos
 
-vars == << msgQs, objLogs, timeOracle, pc, uniqueId, msg, gateway, null, req, 
+vars == << msgQs, objLogs, timeOracle, pc, uniqueId, msg, gateway, req_h, 
+           sender_h, pendingInvos_h, req_t, sender_t, pendingInvos_t, req, 
            sender, pendingInvos >>
 
-ProcSet == {"timeOracle"} \cup (Clients) \cup (Nodes)
+ProcSet == (Clients) \cup {"head"} \cup {"tail"} \cup (Nodes \ {head, tail})
 
 Init == (* Global variables *)
         /\ msgQs = [edge \in Network |-> << >>]
@@ -288,227 +352,311 @@ Init == (* Global variables *)
         /\ uniqueId = [self \in Clients |-> <<self, 1>>]
         /\ msg = [self \in Clients |-> NullReq]
         /\ gateway = [self \in Clients |-> NullNode]
-        /\ null = [self \in Clients |-> << >>]
+        (* Process he *)
+        /\ req_h = NullReq
+        /\ sender_h = NullNode
+        /\ pendingInvos_h = {}
+        (* Process ta *)
+        /\ req_t = NullReq
+        /\ sender_t = NullNode
+        /\ pendingInvos_t = {}
         (* Process n *)
-        /\ req = [self \in Nodes |-> NullReq]
-        /\ sender = [self \in Nodes |-> NullNode]
-        /\ pendingInvos = [self \in Nodes |-> {}]
-        /\ pc = [self \in ProcSet |-> CASE self = "timeOracle" -> "oracle"
-                                        [] self \in Clients -> "clientWrite"
-                                        [] self \in Nodes -> "listen"]
-
-oracle == /\ pc["timeOracle"] = "oracle"
-          /\ pc' = [pc EXCEPT !["timeOracle"] = "increment"]
-          /\ UNCHANGED << msgQs, objLogs, timeOracle, uniqueId, msg, gateway, 
-                          null, req, sender, pendingInvos >>
-
-increment == /\ pc["timeOracle"] = "increment"
-             /\ timeOracle' = timeOracle + 1
-             /\ pc' = [pc EXCEPT !["timeOracle"] = "oracle"]
-             /\ UNCHANGED << msgQs, objLogs, uniqueId, msg, gateway, null, req, 
-                             sender, pendingInvos >>
-
-time == oracle \/ increment
+        /\ req = [self \in Nodes \ {head, tail} |-> NullReq]
+        /\ sender = [self \in Nodes \ {head, tail} |-> NullNode]
+        /\ pendingInvos = [self \in Nodes \ {head, tail} |-> {}]
+        /\ pc = [self \in ProcSet |-> CASE self \in Clients -> "clientWrite"
+                                        [] self = "head" -> "listen_h"
+                                        [] self = "tail" -> "listen_t"
+                                        [] self \in Nodes \ {head, tail} -> "listen"]
 
 clientWrite(self) == /\ pc[self] = "clientWrite"
-                     /\ msgQs' = [msgQs EXCEPT ![self, head] = Append(@, ([  callType |-> WRITE_INV,
-                                                                             uniqueId |-> uniqueId[self],
-                                                                             op |-> [obj |-> CHOOSE o \in Objects: TRUE,
-                                                                                     uniqueId |-> uniqueId[self],
-                                                                                     startTs |-> NullTs,
-                                                                                     commitTs |-> NullTs,
-                                                                                     commitStatus |-> NullCommitStatus]]))]
-                     /\ pc' = [pc EXCEPT ![self] = "waitForIt"]
+                     /\ msgQs' = [msgQs EXCEPT ![<<self, head>>] = Append(@, ([  callType |-> WRITE_INV,
+                                                                                 uniqueId |-> uniqueId[self],
+                                                                                 op |-> [obj |-> CHOOSE o \in Objects: TRUE,
+                                                                                         uniqueId |-> uniqueId[self],
+                                                                                         startTs |-> NullTs,
+                                                                                         commitTs |-> NullTs,
+                                                                                         commitStatus |-> NullCommitStatus]]))]
+                     /\ pc' = [pc EXCEPT ![self] = "recvdWriteResp"]
                      /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, 
-                                     gateway, null, req, sender, pendingInvos >>
-
-waitForIt(self) == /\ pc[self] = "waitForIt"
-                   /\ \E temp \in {s \in SendersTo(self): msgQs[<<s, self>>] /= << >>}:
-                        gateway' = [gateway EXCEPT ![self] = temp]
-                   /\ pc' = [pc EXCEPT ![self] = "recvdWriteResp"]
-                   /\ UNCHANGED << msgQs, objLogs, timeOracle, uniqueId, msg, 
-                                   null, req, sender, pendingInvos >>
+                                     gateway, req_h, sender_h, pendingInvos_h, 
+                                     req_t, sender_t, pendingInvos_t, req, 
+                                     sender, pendingInvos >>
 
 recvdWriteResp(self) == /\ pc[self] = "recvdWriteResp"
-                        /\ msgQs[<<gateway[self], self>>] /= << >>
-                        /\ msg' = [msg EXCEPT ![self] = Head(msgQs[gateway[self], self])]
-                        /\ msgQs' = Tail(msgQs)
+                        /\ \E temp \in {s \in SendersTo(self): msgQs[<<s, self>>] /= << >>}:
+                             gateway' = [gateway EXCEPT ![self] = temp]
+                        /\ msg' = [msg EXCEPT ![self] = Head(msgQs[<<gateway'[self], self>>])]
+                        /\ msgQs' = [msgQs EXCEPT ![<<gateway'[self], self>>] = Tail(@)]
                         /\ Assert((msg'[self].uniqueId = uniqueId[self]), 
-                                  "Failure of assertion at line 168, column 9.")
+                                  "Failure of assertion at line 173, column 9.")
                         /\ Assert((msg'[self].callType = WRITE_RESP), 
-                                  "Failure of assertion at line 169, column 9.")
+                                  "Failure of assertion at line 174, column 9.")
                         /\ pc' = [pc EXCEPT ![self] = "clientRead"]
-                        /\ UNCHANGED << objLogs, timeOracle, uniqueId, gateway, 
-                                        null, req, sender, pendingInvos >>
+                        /\ UNCHANGED << objLogs, timeOracle, uniqueId, req_h, 
+                                        sender_h, pendingInvos_h, req_t, 
+                                        sender_t, pendingInvos_t, req, sender, 
+                                        pendingInvos >>
 
 clientRead(self) == /\ pc[self] = "clientRead"
                     /\ uniqueId' = [uniqueId EXCEPT ![self] = <<self, 2>>]
-                    /\ msgQs' = [msgQs EXCEPT ![self, tail] = Append(@, ([  callType |-> READ_INV,
-                                                                            uniqueId |-> uniqueId'[self],
-                                                                            op |-> [    obj |-> CHOOSE o \in Objects : TRUE,
-                                                                                        uniqueId |-> NullUniqueId,
-                                                                                        startTs |-> NullTs,
-                                                                                        commitTs |-> NullTs,
-                                                                                        commitStatus |-> NullCommitStatus]]))]
-                    /\ \E temp \in {node \in SendersTo(self) : msgQs'[node, self] /= << >>}:
-                         gateway' = [gateway EXCEPT ![self] = temp]
+                    /\ msgQs' = [msgQs EXCEPT ![<<self, tail>>] = Append(@, ([  callType |-> READ_INV,
+                                                                                uniqueId |-> uniqueId'[self],
+                                                                                op |-> [    obj |-> CHOOSE o \in Objects : TRUE,
+                                                                                            uniqueId |-> NullUniqueId,
+                                                                                            startTs |-> NullTs,
+                                                                                            commitTs |-> NullTs,
+                                                                                            commitStatus |-> NullCommitStatus]]))]
                     /\ pc' = [pc EXCEPT ![self] = "recvdReadResp"]
-                    /\ UNCHANGED << objLogs, timeOracle, msg, null, req, 
-                                    sender, pendingInvos >>
+                    /\ UNCHANGED << objLogs, timeOracle, msg, gateway, req_h, 
+                                    sender_h, pendingInvos_h, req_t, sender_t, 
+                                    pendingInvos_t, req, sender, pendingInvos >>
 
 recvdReadResp(self) == /\ pc[self] = "recvdReadResp"
-                       /\ msgQs[<<gateway[self], self>>] /= << >>
-                       /\ msg' = [msg EXCEPT ![self] = Head(msgQs[gateway[self], self])]
-                       /\ msgQs' = Tail(msgQs)
+                       /\ \E temp \in {node \in SendersTo(self) : msgQs[node, self] /= << >>}:
+                            gateway' = [gateway EXCEPT ![self] = temp]
+                       /\ msg' = [msg EXCEPT ![self] = Head(msgQs[<<gateway'[self], self>>])]
+                       /\ msgQs' = [msgQs EXCEPT ![<<gateway'[self], self>>] = Tail(@)]
                        /\ Assert((msg'[self].uniqueId = uniqueId[self]), 
-                                 "Failure of assertion at line 185, column 9.")
-                       /\ Assert((msg'[self].CallType = READ_RESP), 
-                                 "Failure of assertion at line 186, column 9.")
+                                 "Failure of assertion at line 190, column 9.")
+                       /\ Assert((msg'[self].callType = READ_RESP), 
+                                 "Failure of assertion at line 191, column 9.")
                        /\ pc' = [pc EXCEPT ![self] = "Done"]
-                       /\ UNCHANGED << objLogs, timeOracle, uniqueId, gateway, 
-                                       null, req, sender, pendingInvos >>
+                       /\ UNCHANGED << objLogs, timeOracle, uniqueId, req_h, 
+                                       sender_h, pendingInvos_h, req_t, 
+                                       sender_t, pendingInvos_t, req, sender, 
+                                       pendingInvos >>
 
-c(self) == clientWrite(self) \/ waitForIt(self) \/ recvdWriteResp(self)
-              \/ clientRead(self) \/ recvdReadResp(self)
+c(self) == clientWrite(self) \/ recvdWriteResp(self) \/ clientRead(self)
+              \/ recvdReadResp(self)
+
+listen_h == /\ pc["head"] = "listen_h"
+            /\ \E temp \in {s \in SendersTo(head): msgQs[<<s, head>>] /= << >>}:
+                 sender_h' = temp
+            /\ pc' = [pc EXCEPT !["head"] = "incomingMsg_h"]
+            /\ UNCHANGED << msgQs, objLogs, timeOracle, uniqueId, msg, gateway, 
+                            req_h, pendingInvos_h, req_t, sender_t, 
+                            pendingInvos_t, req, sender, pendingInvos >>
+
+incomingMsg_h == /\ pc["head"] = "incomingMsg_h"
+                 /\ req_h' = Head(msgQs[<<sender_h, head>>])
+                 /\ msgQs' = [msgQs EXCEPT ![<<sender_h, head>>] = Tail(@)]
+                 /\ IF req_h'.callType = READ_INV
+                       THEN /\ IF IsDirty(head, req_h'.op.obj)
+                                  THEN /\ pc' = [pc EXCEPT !["head"] = "apportionQ_"]
+                                  ELSE /\ pc' = [pc EXCEPT !["head"] = "respFromHead"]
+                            /\ UNCHANGED objLogs
+                       ELSE /\ IF req_h'.callType = READ_RESP
+                                  THEN /\ pc' = [pc EXCEPT !["head"] = "fwdFromTail_h"]
+                                       /\ UNCHANGED objLogs
+                                  ELSE /\ IF req_h'.callType = WRITE_INV
+                                             THEN /\ objLogs' = [objLogs EXCEPT ![head][([req_h'.op EXCEPT    !.startTs = NullTs,
+                                                                                                              !.commitStatus = DIRTY]).obj] = Cons(([req_h'.op EXCEPT    !.startTs = NullTs,
+                                                                                                                                                                         !.commitStatus = DIRTY]), @)]
+                                                  /\ pc' = [pc EXCEPT !["head"] = "propagate_h"]
+                                             ELSE /\ objLogs' = [objLogs EXCEPT ![head][req_h'.op.obj] = CommitDirtyVersion(@, req_h'.uniqueId)]
+                                                  /\ pc' = [pc EXCEPT !["head"] = "respToClient"]
+                 /\ UNCHANGED << timeOracle, uniqueId, msg, gateway, sender_h, 
+                                 pendingInvos_h, req_t, sender_t, 
+                                 pendingInvos_t, req, sender, pendingInvos >>
+
+apportionQ_ == /\ pc["head"] = "apportionQ_"
+               /\ msgQs' = [msgQs EXCEPT ![<<head, tail>>] = Append(@, req_h)]
+               /\ pendingInvos_h' = (pendingInvos_h \cup {<<(req_h.uniqueId), sender["head"]>>})
+               /\ pc' = [pc EXCEPT !["head"] = "listen_h"]
+               /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, gateway, 
+                               req_h, sender_h, req_t, sender_t, 
+                               pendingInvos_t, req, sender, pendingInvos >>
+
+respFromHead == /\ pc["head"] = "respFromHead"
+                /\ msgQs' = [msgQs EXCEPT ![<<head, sender_h>>] = Append(@, ([    callType |-> READ_RESP,
+                                                                                  uniqueId |-> req_h.uniqueId,
+                                                                                  op |-> Read(head, req_h.op.obj)]))]
+                /\ pc' = [pc EXCEPT !["head"] = "listen_h"]
+                /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, gateway, 
+                                req_h, sender_h, pendingInvos_h, req_t, 
+                                sender_t, pendingInvos_t, req, sender, 
+                                pendingInvos >>
+
+fwdFromTail_h == /\ pc["head"] = "fwdFromTail_h"
+                 /\ msgQs' = [msgQs EXCEPT ![<<head, (Find(pendingInvos_h, req_h.uniqueId))>>] = Append(@, req_h)]
+                 /\ pendingInvos_h' = pendingInvos_h \ {FindPair(pendingInvos_h, (req_h.uniqueId))}
+                 /\ pc' = [pc EXCEPT !["head"] = "listen_h"]
+                 /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, gateway, 
+                                 req_h, sender_h, req_t, sender_t, 
+                                 pendingInvos_t, req, sender, pendingInvos >>
+
+propagate_h == /\ pc["head"] = "propagate_h"
+               /\ msgQs' = [msgQs EXCEPT ![<<head, (Successors[head])>>] = Append(@, req_h)]
+               /\ pendingInvos_h' = (pendingInvos_h \cup {<<(req_h.uniqueId), sender_h>>})
+               /\ pc' = [pc EXCEPT !["head"] = "listen_h"]
+               /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, gateway, 
+                               req_h, sender_h, req_t, sender_t, 
+                               pendingInvos_t, req, sender, pendingInvos >>
+
+respToClient == /\ pc["head"] = "respToClient"
+                /\ msgQs' = [msgQs EXCEPT ![<<head, (Find(pendingInvos_h, req_h.uniqueId))>>] = Append(@, req_h)]
+                /\ pendingInvos_h' = pendingInvos_h \ {FindPair(pendingInvos_h, (req_h.uniqueId))}
+                /\ pc' = [pc EXCEPT !["head"] = "listen_h"]
+                /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, gateway, 
+                                req_h, sender_h, req_t, sender_t, 
+                                pendingInvos_t, req, sender, pendingInvos >>
+
+he == listen_h \/ incomingMsg_h \/ apportionQ_ \/ respFromHead
+         \/ fwdFromTail_h \/ propagate_h \/ respToClient
+
+listen_t == /\ pc["tail"] = "listen_t"
+            /\ \E temp \in {s \in SendersTo(tail) : msgQs[<<s, tail>>] /= << >>}:
+                 sender_t' = temp
+            /\ pc' = [pc EXCEPT !["tail"] = "incomingMsg_t"]
+            /\ UNCHANGED << msgQs, objLogs, timeOracle, uniqueId, msg, gateway, 
+                            req_h, sender_h, pendingInvos_h, req_t, 
+                            pendingInvos_t, req, sender, pendingInvos >>
+
+incomingMsg_t == /\ pc["tail"] = "incomingMsg_t"
+                 /\ req_t' = Head(msgQs[<<sender_t, tail>>])
+                 /\ msgQs' = [msgQs EXCEPT ![<<sender_t, tail>>] = Tail(@)]
+                 /\ IF req_t'.callType = READ_INV
+                       THEN /\ pc' = [pc EXCEPT !["tail"] = "respFromSelf_t"]
+                            /\ UNCHANGED objLogs
+                       ELSE /\ objLogs' = [objLogs EXCEPT ![tail][([req_t'.op EXCEPT  !.commitTs = NullTs,
+                                                                                      !.commitStatus = CLEAN]).obj] = Cons(([req_t'.op EXCEPT  !.commitTs = NullTs,
+                                                                                                                                               !.commitStatus = CLEAN]), @)]
+                            /\ pc' = [pc EXCEPT !["tail"] = "tailAck"]
+                 /\ UNCHANGED << timeOracle, uniqueId, msg, gateway, req_h, 
+                                 sender_h, pendingInvos_h, sender_t, 
+                                 pendingInvos_t, req, sender, pendingInvos >>
+
+respFromSelf_t == /\ pc["tail"] = "respFromSelf_t"
+                  /\ msgQs' = [msgQs EXCEPT ![<<tail, sender_t>>] = Append(@, ([  callType |-> READ_RESP,
+                                                                                  uniqueId |-> req_t.uniqueId,
+                                                                                  op |-> Read(tail, req_t.op.obj)]))]
+                  /\ pc' = [pc EXCEPT !["tail"] = "listen_t"]
+                  /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, gateway, 
+                                  req_h, sender_h, pendingInvos_h, req_t, 
+                                  sender_t, pendingInvos_t, req, sender, 
+                                  pendingInvos >>
+
+tailAck == /\ pc["tail"] = "tailAck"
+           /\ msgQs' = [msgQs EXCEPT ![<<tail, (Predecessors[tail])>>] = Append(@, ([   callType |-> WRITE_RESP,
+                                                                                        uniqueId |-> req_t.uniqueId,
+                                                                                        op |-> Read(tail, req_t.op.obj)]))]
+           /\ pc' = [pc EXCEPT !["tail"] = "listen_t"]
+           /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, gateway, req_h, 
+                           sender_h, pendingInvos_h, req_t, sender_t, 
+                           pendingInvos_t, req, sender, pendingInvos >>
+
+ta == listen_t \/ incomingMsg_t \/ respFromSelf_t \/ tailAck
 
 listen(self) == /\ pc[self] = "listen"
-                /\ pc' = [pc EXCEPT ![self] = "waitForIt2"]
+                /\ \E temp \in {s \in SendersTo(self) : msgQs[<<s, self>>] /= << >>}:
+                     sender' = [sender EXCEPT ![self] = temp]
+                /\ pc' = [pc EXCEPT ![self] = "incomingMsg"]
                 /\ UNCHANGED << msgQs, objLogs, timeOracle, uniqueId, msg, 
-                                gateway, null, req, sender, pendingInvos >>
-
-waitForIt2(self) == /\ pc[self] = "waitForIt2"
-                    /\ \E temp \in {s \in SendersTo(self) : msgQs[<<s, self>>] /= << >>}:
-                         sender' = [sender EXCEPT ![self] = temp]
-                    /\ pc' = [pc EXCEPT ![self] = "incomingMsg"]
-                    /\ UNCHANGED << msgQs, objLogs, timeOracle, uniqueId, msg, 
-                                    gateway, null, req, pendingInvos >>
+                                gateway, req_h, sender_h, pendingInvos_h, 
+                                req_t, sender_t, pendingInvos_t, req, 
+                                pendingInvos >>
 
 incomingMsg(self) == /\ pc[self] = "incomingMsg"
-                     /\ msgQs[<<sender[self], self>>] /= << >>
-                     /\ req' = [req EXCEPT ![self] = Head(msgQs[sender[self], self])]
-                     /\ msgQs' = Tail(msgQs)
-                     /\ pc' = [pc EXCEPT ![self] = "readInv"]
-                     /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, 
-                                     gateway, null, sender, pendingInvos >>
-
-readInv(self) == /\ pc[self] = "readInv"
-                 /\ IF req[self].callType = READ_INV
-                       THEN /\ IF IsDirty(self, req[self].op.obj)
-                                  THEN /\ pc' = [pc EXCEPT ![self] = "apportionQ"]
-                                  ELSE /\ pc' = [pc EXCEPT ![self] = "respFromSelf"]
-                       ELSE /\ pc' = [pc EXCEPT ![self] = "readResp"]
-                 /\ UNCHANGED << msgQs, objLogs, timeOracle, uniqueId, msg, 
-                                 gateway, null, req, sender, pendingInvos >>
+                     /\ req' = [req EXCEPT ![self] = Head(msgQs[<<sender[self], self>>])]
+                     /\ msgQs' = [msgQs EXCEPT ![<<sender[self], self>>] = Tail(@)]
+                     /\ IF req'[self].callType = READ_INV
+                           THEN /\ IF IsDirty(self, req'[self].op.obj)
+                                      THEN /\ pc' = [pc EXCEPT ![self] = "apportionQ"]
+                                      ELSE /\ pc' = [pc EXCEPT ![self] = "respFromSelf"]
+                                /\ UNCHANGED objLogs
+                           ELSE /\ IF req'[self].callType = READ_RESP
+                                      THEN /\ pc' = [pc EXCEPT ![self] = "fwdFromTail"]
+                                           /\ UNCHANGED objLogs
+                                      ELSE /\ IF req'[self].callType = WRITE_INV
+                                                 THEN /\ objLogs' = [objLogs EXCEPT ![self][(req'[self].op).obj] = Cons((req'[self].op), @)]
+                                                      /\ pc' = [pc EXCEPT ![self] = "propagate"]
+                                                 ELSE /\ objLogs' = [objLogs EXCEPT ![self][req'[self].op.obj] = CommitDirtyVersion(@, req'[self].uniqueId)]
+                                                      /\ pc' = [pc EXCEPT ![self] = "backProp"]
+                     /\ UNCHANGED << timeOracle, uniqueId, msg, gateway, req_h, 
+                                     sender_h, pendingInvos_h, req_t, sender_t, 
+                                     pendingInvos_t, sender, pendingInvos >>
 
 apportionQ(self) == /\ pc[self] = "apportionQ"
-                    /\ msgQs' = [msgQs EXCEPT ![self, tail] = Append(@, req[self])]
+                    /\ msgQs' = [msgQs EXCEPT ![<<self, tail>>] = Append(@, req[self])]
                     /\ pendingInvos' = [pendingInvos EXCEPT ![self] = pendingInvos[self] \cup {<<(req[self].uniqueId), sender[self]>>}]
-                    /\ pc' = [pc EXCEPT ![self] = "readResp"]
+                    /\ pc' = [pc EXCEPT ![self] = "listen"]
                     /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, 
-                                    gateway, null, req, sender >>
+                                    gateway, req_h, sender_h, pendingInvos_h, 
+                                    req_t, sender_t, pendingInvos_t, req, 
+                                    sender >>
 
 respFromSelf(self) == /\ pc[self] = "respFromSelf"
-                      /\ msgQs' = [msgQs EXCEPT ![self, sender[self]] = Append(@, ([  callType |-> READ_RESP,
-                                                                                      uniqueId |-> req[self].uniqueId,
-                                                                                      op |-> Read(self, req[self].op.obj)]))]
-                      /\ pc' = [pc EXCEPT ![self] = "readResp"]
-                      /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, 
-                                      gateway, null, req, sender, pendingInvos >>
-
-readResp(self) == /\ pc[self] = "readResp"
-                  /\ IF req[self].callType = READ_RESP
-                        THEN /\ pc' = [pc EXCEPT ![self] = "fwdFromTail"]
-                        ELSE /\ pc' = [pc EXCEPT ![self] = "writeInv"]
-                  /\ UNCHANGED << msgQs, objLogs, timeOracle, uniqueId, msg, 
-                                  gateway, null, req, sender, pendingInvos >>
-
-fwdFromTail(self) == /\ pc[self] = "fwdFromTail"
-                     /\ msgQs' = [msgQs EXCEPT ![self, (Find(pendingInvos[self], req[self].uniqueId))] = Append(@, req[self])]
-                     /\ pendingInvos' = [pendingInvos EXCEPT ![self] = @ \ {CHOOSE kv \in pendingInvos[self] : kv[1] = (req[self].uniqueId)}]
-                     /\ pc' = [pc EXCEPT ![self] = "writeInv"]
-                     /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, 
-                                     gateway, null, req, sender >>
-
-writeInv(self) == /\ pc[self] = "writeInv"
-                  /\ IF req[self].callType = WRITE_INV
-                        THEN /\ IF self = tail
-                                   THEN /\ objLogs' = [objLogs EXCEPT ![self][([req[self].op EXCEPT  !.commitTs = Now,
-                                                                                                     !.commitStatus = CLEAN]).obj] = Cons(([req[self].op EXCEPT  !.commitTs = Now,
-                                                                                                                                                                 !.commitStatus = CLEAN]), @)]
-                                        /\ pc' = [pc EXCEPT ![self] = "tailAck"]
-                                   ELSE /\ IF self = head
-                                              THEN /\ objLogs' = [objLogs EXCEPT ![self][([req[self].op EXCEPT  !.startTs = Now,
-                                                                                                                !.commitStatus = DIRTY]).obj] = Cons(([req[self].op EXCEPT  !.startTs = Now,
-                                                                                                                                                                            !.commitStatus = DIRTY]), @)]
-                                              ELSE /\ objLogs' = [objLogs EXCEPT ![self][(req[self].op).obj] = Cons((req[self].op), @)]
-                                        /\ pc' = [pc EXCEPT ![self] = "propagate"]
-                        ELSE /\ pc' = [pc EXCEPT ![self] = "writeResp"]
-                             /\ UNCHANGED objLogs
-                  /\ UNCHANGED << msgQs, timeOracle, uniqueId, msg, gateway, 
-                                  null, req, sender, pendingInvos >>
-
-tailAck(self) == /\ pc[self] = "tailAck"
-                 /\ msgQs' = [msgQs EXCEPT ![self, (Predecessors[self])] = Append(@, ([   callType |-> WRITE_RESP,
+                      /\ msgQs' = [msgQs EXCEPT ![<<self, sender[self]>>] = Append(@, ([  callType |-> READ_RESP,
                                                                                           uniqueId |-> req[self].uniqueId,
                                                                                           op |-> Read(self, req[self].op.obj)]))]
-                 /\ pc' = [pc EXCEPT ![self] = "writeResp"]
-                 /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, gateway, 
-                                 null, req, sender, pendingInvos >>
+                      /\ pc' = [pc EXCEPT ![self] = "listen"]
+                      /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, 
+                                      gateway, req_h, sender_h, pendingInvos_h, 
+                                      req_t, sender_t, pendingInvos_t, req, 
+                                      sender, pendingInvos >>
+
+fwdFromTail(self) == /\ pc[self] = "fwdFromTail"
+                     /\ msgQs' = [msgQs EXCEPT ![<<self, (Find(pendingInvos[self], req[self].uniqueId))>>] = Append(@, req[self])]
+                     /\ pendingInvos' = [pendingInvos EXCEPT ![self] = pendingInvos[self] \ {FindPair(pendingInvos[self], (req[self].uniqueId))}]
+                     /\ pc' = [pc EXCEPT ![self] = "listen"]
+                     /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, 
+                                     gateway, req_h, sender_h, pendingInvos_h, 
+                                     req_t, sender_t, pendingInvos_t, req, 
+                                     sender >>
 
 propagate(self) == /\ pc[self] = "propagate"
-                   /\ msgQs' = [msgQs EXCEPT ![self, (Successors[self])] = Append(@, req[self])]
+                   /\ msgQs' = [msgQs EXCEPT ![<<self, (Successors[self])>>] = Append(@, req[self])]
                    /\ pendingInvos' = [pendingInvos EXCEPT ![self] = pendingInvos[self] \cup {<<(req[self].uniqueId), sender[self]>>}]
-                   /\ pc' = [pc EXCEPT ![self] = "writeResp"]
+                   /\ pc' = [pc EXCEPT ![self] = "listen"]
                    /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, gateway, 
-                                   null, req, sender >>
-
-writeResp(self) == /\ pc[self] = "writeResp"
-                   /\ IF req[self].callType = WRITE_RESP
-                         THEN /\ objLogs' = [objLogs EXCEPT ![self][req[self].op.obj] = CommitDirtyVersion(@, req[self].uniqueId)]
-                              /\ pc' = [pc EXCEPT ![self] = "backProp"]
-                         ELSE /\ pc' = [pc EXCEPT ![self] = "listen"]
-                              /\ UNCHANGED objLogs
-                   /\ UNCHANGED << msgQs, timeOracle, uniqueId, msg, gateway, 
-                                   null, req, sender, pendingInvos >>
+                                   req_h, sender_h, pendingInvos_h, req_t, 
+                                   sender_t, pendingInvos_t, req, sender >>
 
 backProp(self) == /\ pc[self] = "backProp"
-                  /\ msgQs' = [msgQs EXCEPT ![self, (Find(pendingInvos[self], req[self].uniqueId))] = Append(@, req[self])]
-                  /\ pendingInvos' = [pendingInvos EXCEPT ![self] = @ \ {CHOOSE kv \in pendingInvos[self] : kv[1] = (req[self].uniqueId)}]
+                  /\ msgQs' = [msgQs EXCEPT ![<<self, (Find(pendingInvos[self], req[self].uniqueId))>>] = Append(@, req[self])]
+                  /\ pendingInvos' = [pendingInvos EXCEPT ![self] = pendingInvos[self] \ {FindPair(pendingInvos[self], (req[self].uniqueId))}]
                   /\ pc' = [pc EXCEPT ![self] = "listen"]
                   /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, gateway, 
-                                  null, req, sender >>
+                                  req_h, sender_h, pendingInvos_h, req_t, 
+                                  sender_t, pendingInvos_t, req, sender >>
 
-n(self) == listen(self) \/ waitForIt2(self) \/ incomingMsg(self)
-              \/ readInv(self) \/ apportionQ(self) \/ respFromSelf(self)
-              \/ readResp(self) \/ fwdFromTail(self) \/ writeInv(self)
-              \/ tailAck(self) \/ propagate(self) \/ writeResp(self)
+n(self) == listen(self) \/ incomingMsg(self) \/ apportionQ(self)
+              \/ respFromSelf(self) \/ fwdFromTail(self) \/ propagate(self)
               \/ backProp(self)
 
-Next == time
+Next == he \/ ta
            \/ (\E self \in Clients: c(self))
-           \/ (\E self \in Nodes: n(self))
+           \/ (\E self \in Nodes \ {head, tail}: n(self))
 
 Spec == /\ Init /\ [][Next]_vars
         /\ WF_vars(Next)
-        /\ WF_vars(time)
         /\ \A self \in Clients : WF_vars(c(self))
-        /\ \A self \in Nodes : WF_vars(n(self))
+        /\ WF_vars(he)
+        /\ WF_vars(ta)
+        /\ \A self \in Nodes \ {head, tail} : WF_vars(n(self))
 
 \* END TRANSLATION 
 
 TypeInvariant == TRUE
 \*TypeInvariant ==    /\ msgQs \in [Network -> {<< >>} \cup Seq(RequestType)]
 \*                    /\ objLogs \in [Nodes -> [Objects -> {<< >>} \cup Seq(ObjectVersionType)]]
-\*                    /\ timeOracle \in 1..MaxTimestamp
+\*                    /\ timeOracle \in Nat
 \*                    /\ uniqueId \in [Clients -> UniqueIdType]
 \*                    /\ msg \in [Clients -> RequestType \cup {NullReq}]
 \*                    /\ gateway \in [Clients -> Nodes \cup {NullNode}] 
-\*                    /\ req \in [Nodes -> RequestType \cup {NullReq}]
-\*                    /\ sender \in [Nodes -> Nodes \cup {NullNode}]
+\*                    /\ req \in [Nodes \ {head, tail} -> RequestType \cup {NullReq}]
+\*                    /\ sender \in [Nodes \ {head, tail} -> Nodes \cup {NullNode}]
+\*                    /\ req_h \in RequestType \cup {NullReq}
+\*                    /\ sender_h \in Nodes \cup {NullNode}
+\*                    /\ req_t \in RequestType \cup {NullReq}
+\*                    /\ sender_t \in Nodes \cup {NullNode}
+                    
 \*                    /\ pendingInvos \in [Nodes -> thisoneshard
 
 
 =============================================================================
 \* Modification History
+\* Last modified Thu Jun 15 01:26:22 EDT 2023 by 72jen
 \* Last modified Wed Jun 14 16:32:20 EDT 2023 by jenniferlam
 \* Created Tue Jun 13 12:56:59 EDT 2023 by jenniferlam
