@@ -27,6 +27,7 @@ ClientEdges == EdgesFromClients \cup EdgesToClients
 Network == Edges \cup ClientEdges
 
 UniqueIdType == {<<c, id>> : c \in Clients, id \in 0..NumMsgs}
+NullUniqueId == CHOOSE id : id \notin UniqueIdType
 SendersTo(n) == {edge[1]: edge \in {e \in Network: e[2] = n}}
 
 ASSUME  /\ head \in Nodes
@@ -52,23 +53,28 @@ WRITE_RESP == "WRITE_RESP" \* Write response
 CLEAN == "CLEAN"
 DIRTY == "DIRTY"
 
+
+NullNode == CHOOSE n : n \notin Nodes
+
 ActionType == {READ, WRITE}
 
 CallType == {READ_INV, WRITE_INV, READ_RESP, WRITE_RESP}
 
 CommitType == {CLEAN, DIRTY}
+NullCommitStatus == CHOOSE status : status \notin CommitType
 
 TimestampType == { t: t \in 0..MaxTimestamp}
+NullTs == CHOOSE ts : ts \notin TimestampType
 ObjectVersionType == [  obj: Objects, 
-                        uniqueId: UniqueIdType, 
-                        startTs: TimestampType, 
-                        commitTs: TimestampType, 
-                        commitStatus: CommitType]
+                        uniqueId: UniqueIdType \cup {NullUniqueId}, 
+                        startTs: TimestampType \cup {NullTs}, 
+                        commitTs: TimestampType \cup {NullTs}, 
+                        commitStatus: CommitType \cup {NullCommitStatus}]
              
 RequestType == [callType: CallType, 
-                uniqueId: UniqueIdType,
+                uniqueId: UniqueIdType \cup {NullUniqueId},
                 op: ObjectVersionType]
-PacketType == [src: Nodes, dest: Nodes, payload: RequestType] 
+NullReq == CHOOSE r : r \notin RequestType
 
 Cons(item, seq) == << item >> \o seq   
 
@@ -97,17 +103,13 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         
         IsDirty(node, obj) == Head(objLogs[node][obj]).commitStatus = DIRTY
         
-\*        NullReq == CHOOSE r : r \notin RequestType
-\*        NullNode == CHOOSE n : n \notin Nodes
-\*        NullTs == CHOOSE ts : ts \notin TimestampType
-\*        NullUniqueId == CHOOSE id : id \notin UniqueIdType
-\*        NullCommitStatus == CHOOSE status : status \notin CommitType
+
         
-        NullReq == CHOOSE r \in RequestType: TRUE
-        NullNode == CHOOSE n \in Nodes : TRUE
-        NullTs == CHOOSE ts \in TimestampType : TRUE
-        NullUniqueId == CHOOSE id \in UniqueIdType: TRUE
-        NullCommitStatus == CHOOSE status \in CommitType : TRUE
+\*        NullReq == CHOOSE r \in RequestType: TRUE
+\*        NullNode == CHOOSE n \in Nodes : TRUE
+\*        NullTs == CHOOSE ts \in TimestampType : TRUE
+\*        NullUniqueId == CHOOSE id \in UniqueIdType: TRUE
+\*        NullCommitStatus == CHOOSE status \in CommitType : TRUE
         
         Read(node, obj) == Head(objLogs[node][obj])
         FindPair(set, k) == CHOOSE kv \in set: kv[1] = k
@@ -173,7 +175,7 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         assert(msg.uniqueId = uniqueId);
         assert(msg.callType = WRITE_RESP);
         
-        clientRead:
+        clientReadToTail:
         uniqueId := <<self, 2>>;
         send(self, tail, [  callType |-> READ_INV,
                             uniqueId |-> uniqueId,
@@ -189,6 +191,61 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         recv(gateway, self, msg);
         assert(msg.uniqueId = uniqueId);
         assert(msg.callType = READ_RESP);
+        
+        clientReadToHead:
+        uniqueId := <<self, 3>>;
+        send(self, head, [  callType |-> READ_INV,
+                            uniqueId |-> uniqueId,
+                            op |-> [    obj |-> CHOOSE o \in Objects : TRUE,
+                                        uniqueId |-> NullUniqueId,
+                                        startTs |-> NullTs,
+                                        commitTs |-> NullTs,
+                                        commitStatus |-> NullCommitStatus]]);
+                                        
+        recvdReadRespFromHead: 
+        with (temp \in {node \in SendersTo(self) : msgQs[node, self] /= << >>}) {
+            gateway := temp;
+        }; 
+        recv(gateway, self, msg);
+        assert(msg.uniqueId = uniqueId);
+        assert(msg.callType = READ_RESP);
+        
+        concurrentWrite:
+        uniqueId := <<self, 4>>;
+        send(self, head, [  callType |-> WRITE_INV,
+                            uniqueId |-> uniqueId,
+                            op |-> [obj |-> CHOOSE o \in Objects: TRUE,
+                                    uniqueId |-> uniqueId,
+                                    startTs |-> NullTs,
+                                    commitTs |-> NullTs,
+                                    commitStatus |-> NullCommitStatus]]);
+                                    
+        concurrentRead:
+        uniqueId := <<self, 5>>;
+        send(self, head, [  callType |-> READ_INV,
+                            uniqueId |-> uniqueId,
+                            op |-> [    obj |-> CHOOSE o \in Objects: TRUE,
+                                        uniqueId |-> NullUniqueId,
+                                        startTs |-> NullTs,
+                                        commitTs |-> NullTs,
+                                        commitStatus |-> NullCommitStatus]]);
+        waitForConcurrentWrite:
+        with (temp \in {node \in SendersTo(self) : msgQs[node, self] /= << >>}) {
+            gateway := temp;
+        };
+        recv(gateway, self, msg);
+        assert(msg.callType = WRITE_RESP);
+        assert(msg.uniqueId = <<self, 4>>);
+        
+        waitForConcurrentRead:
+        with (temp \in {node \in SendersTo(self) : msgQs[node, self] /= << >>}) {
+            gateway := temp;
+        };
+        recv(gateway, self, msg);
+        assert(msg.callType = READ_RESP);
+        assert(msg.uniqueId = uniqueId);
+        
+        
     }
     
     fair process(he="head") 
@@ -205,8 +262,8 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
             
             if (req_h.callType = READ_INV) {
                 if (IsDirty(head, req_h.op.obj)) {
-                    apportionQ: send(head, tail, req_h);
-                    add(pendingInvos_h, req_h.uniqueId, sender);
+                    apportionQ_h: send(head, tail, req_h);
+                    add(pendingInvos_h, req_h.uniqueId, sender_h);
                 } else {
                     respFromHead: send(head, sender_h, [    callType |-> READ_RESP,
                                                             uniqueId |-> req_h.uniqueId,
@@ -303,8 +360,7 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
 }
 
 ****************************************************************************)
-\* BEGIN TRANSLATION (chksum(pcal) = "f67d21c6" /\ chksum(tla) = "70c88750")
-\* Label apportionQ of process he at line 120 col 9 changed to apportionQ_
+\* BEGIN TRANSLATION (chksum(pcal) = "8a446dfb" /\ chksum(tla) = "8fdcf47b")
 VARIABLES msgQs, objLogs, timeOracle, pc
 
 (* define statement *)
@@ -325,11 +381,7 @@ IsDirty(node, obj) == Head(objLogs[node][obj]).commitStatus = DIRTY
 
 
 
-NullReq == CHOOSE r \in RequestType: TRUE
-NullNode == CHOOSE n \in Nodes : TRUE
-NullTs == CHOOSE ts \in TimestampType : TRUE
-NullUniqueId == CHOOSE id \in UniqueIdType: TRUE
-NullCommitStatus == CHOOSE status \in CommitType : TRUE
+
 
 Read(node, obj) == Head(objLogs[node][obj])
 FindPair(set, k) == CHOOSE kv \in set: kv[1] = k
@@ -389,28 +441,29 @@ recvdWriteResp(self) == /\ pc[self] = "recvdWriteResp"
                         /\ msg' = [msg EXCEPT ![self] = Head(msgQs[<<gateway'[self], self>>])]
                         /\ msgQs' = [msgQs EXCEPT ![<<gateway'[self], self>>] = Tail(@)]
                         /\ Assert((msg'[self].uniqueId = uniqueId[self]), 
-                                  "Failure of assertion at line 173, column 9.")
+                                  "Failure of assertion at line 175, column 9.")
                         /\ Assert((msg'[self].callType = WRITE_RESP), 
-                                  "Failure of assertion at line 174, column 9.")
-                        /\ pc' = [pc EXCEPT ![self] = "clientRead"]
+                                  "Failure of assertion at line 176, column 9.")
+                        /\ pc' = [pc EXCEPT ![self] = "clientReadToTail"]
                         /\ UNCHANGED << objLogs, timeOracle, uniqueId, req_h, 
                                         sender_h, pendingInvos_h, req_t, 
                                         sender_t, pendingInvos_t, req, sender, 
                                         pendingInvos >>
 
-clientRead(self) == /\ pc[self] = "clientRead"
-                    /\ uniqueId' = [uniqueId EXCEPT ![self] = <<self, 2>>]
-                    /\ msgQs' = [msgQs EXCEPT ![<<self, tail>>] = Append(@, ([  callType |-> READ_INV,
-                                                                                uniqueId |-> uniqueId'[self],
-                                                                                op |-> [    obj |-> CHOOSE o \in Objects : TRUE,
-                                                                                            uniqueId |-> NullUniqueId,
-                                                                                            startTs |-> NullTs,
-                                                                                            commitTs |-> NullTs,
-                                                                                            commitStatus |-> NullCommitStatus]]))]
-                    /\ pc' = [pc EXCEPT ![self] = "recvdReadResp"]
-                    /\ UNCHANGED << objLogs, timeOracle, msg, gateway, req_h, 
-                                    sender_h, pendingInvos_h, req_t, sender_t, 
-                                    pendingInvos_t, req, sender, pendingInvos >>
+clientReadToTail(self) == /\ pc[self] = "clientReadToTail"
+                          /\ uniqueId' = [uniqueId EXCEPT ![self] = <<self, 2>>]
+                          /\ msgQs' = [msgQs EXCEPT ![<<self, tail>>] = Append(@, ([  callType |-> READ_INV,
+                                                                                      uniqueId |-> uniqueId'[self],
+                                                                                      op |-> [    obj |-> CHOOSE o \in Objects : TRUE,
+                                                                                                  uniqueId |-> NullUniqueId,
+                                                                                                  startTs |-> NullTs,
+                                                                                                  commitTs |-> NullTs,
+                                                                                                  commitStatus |-> NullCommitStatus]]))]
+                          /\ pc' = [pc EXCEPT ![self] = "recvdReadResp"]
+                          /\ UNCHANGED << objLogs, timeOracle, msg, gateway, 
+                                          req_h, sender_h, pendingInvos_h, 
+                                          req_t, sender_t, pendingInvos_t, req, 
+                                          sender, pendingInvos >>
 
 recvdReadResp(self) == /\ pc[self] = "recvdReadResp"
                        /\ \E temp \in {node \in SendersTo(self) : msgQs[node, self] /= << >>}:
@@ -418,17 +471,112 @@ recvdReadResp(self) == /\ pc[self] = "recvdReadResp"
                        /\ msg' = [msg EXCEPT ![self] = Head(msgQs[<<gateway'[self], self>>])]
                        /\ msgQs' = [msgQs EXCEPT ![<<gateway'[self], self>>] = Tail(@)]
                        /\ Assert((msg'[self].uniqueId = uniqueId[self]), 
-                                 "Failure of assertion at line 190, column 9.")
+                                 "Failure of assertion at line 192, column 9.")
                        /\ Assert((msg'[self].callType = READ_RESP), 
-                                 "Failure of assertion at line 191, column 9.")
-                       /\ pc' = [pc EXCEPT ![self] = "Done"]
+                                 "Failure of assertion at line 193, column 9.")
+                       /\ pc' = [pc EXCEPT ![self] = "clientReadToHead"]
                        /\ UNCHANGED << objLogs, timeOracle, uniqueId, req_h, 
                                        sender_h, pendingInvos_h, req_t, 
                                        sender_t, pendingInvos_t, req, sender, 
                                        pendingInvos >>
 
-c(self) == clientWrite(self) \/ recvdWriteResp(self) \/ clientRead(self)
-              \/ recvdReadResp(self)
+clientReadToHead(self) == /\ pc[self] = "clientReadToHead"
+                          /\ uniqueId' = [uniqueId EXCEPT ![self] = <<self, 3>>]
+                          /\ msgQs' = [msgQs EXCEPT ![<<self, head>>] = Append(@, ([  callType |-> READ_INV,
+                                                                                      uniqueId |-> uniqueId'[self],
+                                                                                      op |-> [    obj |-> CHOOSE o \in Objects : TRUE,
+                                                                                                  uniqueId |-> NullUniqueId,
+                                                                                                  startTs |-> NullTs,
+                                                                                                  commitTs |-> NullTs,
+                                                                                                  commitStatus |-> NullCommitStatus]]))]
+                          /\ pc' = [pc EXCEPT ![self] = "recvdReadRespFromHead"]
+                          /\ UNCHANGED << objLogs, timeOracle, msg, gateway, 
+                                          req_h, sender_h, pendingInvos_h, 
+                                          req_t, sender_t, pendingInvos_t, req, 
+                                          sender, pendingInvos >>
+
+recvdReadRespFromHead(self) == /\ pc[self] = "recvdReadRespFromHead"
+                               /\ \E temp \in {node \in SendersTo(self) : msgQs[node, self] /= << >>}:
+                                    gateway' = [gateway EXCEPT ![self] = temp]
+                               /\ msg' = [msg EXCEPT ![self] = Head(msgQs[<<gateway'[self], self>>])]
+                               /\ msgQs' = [msgQs EXCEPT ![<<gateway'[self], self>>] = Tail(@)]
+                               /\ Assert((msg'[self].uniqueId = uniqueId[self]), 
+                                         "Failure of assertion at line 210, column 9.")
+                               /\ Assert((msg'[self].callType = READ_RESP), 
+                                         "Failure of assertion at line 211, column 9.")
+                               /\ pc' = [pc EXCEPT ![self] = "concurrentWrite"]
+                               /\ UNCHANGED << objLogs, timeOracle, uniqueId, 
+                                               req_h, sender_h, pendingInvos_h, 
+                                               req_t, sender_t, pendingInvos_t, 
+                                               req, sender, pendingInvos >>
+
+concurrentWrite(self) == /\ pc[self] = "concurrentWrite"
+                         /\ uniqueId' = [uniqueId EXCEPT ![self] = <<self, 4>>]
+                         /\ msgQs' = [msgQs EXCEPT ![<<self, head>>] = Append(@, ([  callType |-> WRITE_INV,
+                                                                                     uniqueId |-> uniqueId'[self],
+                                                                                     op |-> [obj |-> CHOOSE o \in Objects: TRUE,
+                                                                                             uniqueId |-> uniqueId'[self],
+                                                                                             startTs |-> NullTs,
+                                                                                             commitTs |-> NullTs,
+                                                                                             commitStatus |-> NullCommitStatus]]))]
+                         /\ pc' = [pc EXCEPT ![self] = "concurrentRead"]
+                         /\ UNCHANGED << objLogs, timeOracle, msg, gateway, 
+                                         req_h, sender_h, pendingInvos_h, 
+                                         req_t, sender_t, pendingInvos_t, req, 
+                                         sender, pendingInvos >>
+
+concurrentRead(self) == /\ pc[self] = "concurrentRead"
+                        /\ uniqueId' = [uniqueId EXCEPT ![self] = <<self, 5>>]
+                        /\ msgQs' = [msgQs EXCEPT ![<<self, head>>] = Append(@, ([  callType |-> READ_INV,
+                                                                                    uniqueId |-> uniqueId'[self],
+                                                                                    op |-> [    obj |-> CHOOSE o \in Objects: TRUE,
+                                                                                                uniqueId |-> NullUniqueId,
+                                                                                                startTs |-> NullTs,
+                                                                                                commitTs |-> NullTs,
+                                                                                                commitStatus |-> NullCommitStatus]]))]
+                        /\ pc' = [pc EXCEPT ![self] = "waitForConcurrentWrite"]
+                        /\ UNCHANGED << objLogs, timeOracle, msg, gateway, 
+                                        req_h, sender_h, pendingInvos_h, req_t, 
+                                        sender_t, pendingInvos_t, req, sender, 
+                                        pendingInvos >>
+
+waitForConcurrentWrite(self) == /\ pc[self] = "waitForConcurrentWrite"
+                                /\ \E temp \in {node \in SendersTo(self) : msgQs[node, self] /= << >>}:
+                                     gateway' = [gateway EXCEPT ![self] = temp]
+                                /\ msg' = [msg EXCEPT ![self] = Head(msgQs[<<gateway'[self], self>>])]
+                                /\ msgQs' = [msgQs EXCEPT ![<<gateway'[self], self>>] = Tail(@)]
+                                /\ Assert((msg'[self].callType = WRITE_RESP), 
+                                          "Failure of assertion at line 237, column 9.")
+                                /\ Assert((msg'[self].uniqueId = <<self, 4>>), 
+                                          "Failure of assertion at line 238, column 9.")
+                                /\ pc' = [pc EXCEPT ![self] = "waitForConcurrentRead"]
+                                /\ UNCHANGED << objLogs, timeOracle, uniqueId, 
+                                                req_h, sender_h, 
+                                                pendingInvos_h, req_t, 
+                                                sender_t, pendingInvos_t, req, 
+                                                sender, pendingInvos >>
+
+waitForConcurrentRead(self) == /\ pc[self] = "waitForConcurrentRead"
+                               /\ \E temp \in {node \in SendersTo(self) : msgQs[node, self] /= << >>}:
+                                    gateway' = [gateway EXCEPT ![self] = temp]
+                               /\ msg' = [msg EXCEPT ![self] = Head(msgQs[<<gateway'[self], self>>])]
+                               /\ msgQs' = [msgQs EXCEPT ![<<gateway'[self], self>>] = Tail(@)]
+                               /\ Assert((msg'[self].callType = READ_RESP), 
+                                         "Failure of assertion at line 245, column 9.")
+                               /\ Assert((msg'[self].uniqueId = uniqueId[self]), 
+                                         "Failure of assertion at line 246, column 9.")
+                               /\ pc' = [pc EXCEPT ![self] = "Done"]
+                               /\ UNCHANGED << objLogs, timeOracle, uniqueId, 
+                                               req_h, sender_h, pendingInvos_h, 
+                                               req_t, sender_t, pendingInvos_t, 
+                                               req, sender, pendingInvos >>
+
+c(self) == clientWrite(self) \/ recvdWriteResp(self)
+              \/ clientReadToTail(self) \/ recvdReadResp(self)
+              \/ clientReadToHead(self) \/ recvdReadRespFromHead(self)
+              \/ concurrentWrite(self) \/ concurrentRead(self)
+              \/ waitForConcurrentWrite(self)
+              \/ waitForConcurrentRead(self)
 
 listen_h == /\ pc["head"] = "listen_h"
             /\ \E temp \in {s \in SendersTo(head): msgQs[<<s, head>>] /= << >>}:
@@ -443,7 +591,7 @@ incomingMsg_h == /\ pc["head"] = "incomingMsg_h"
                  /\ msgQs' = [msgQs EXCEPT ![<<sender_h, head>>] = Tail(@)]
                  /\ IF req_h'.callType = READ_INV
                        THEN /\ IF IsDirty(head, req_h'.op.obj)
-                                  THEN /\ pc' = [pc EXCEPT !["head"] = "apportionQ_"]
+                                  THEN /\ pc' = [pc EXCEPT !["head"] = "apportionQ_h"]
                                   ELSE /\ pc' = [pc EXCEPT !["head"] = "respFromHead"]
                             /\ UNCHANGED objLogs
                        ELSE /\ IF req_h'.callType = READ_RESP
@@ -460,13 +608,13 @@ incomingMsg_h == /\ pc["head"] = "incomingMsg_h"
                                  pendingInvos_h, req_t, sender_t, 
                                  pendingInvos_t, req, sender, pendingInvos >>
 
-apportionQ_ == /\ pc["head"] = "apportionQ_"
-               /\ msgQs' = [msgQs EXCEPT ![<<head, tail>>] = Append(@, req_h)]
-               /\ pendingInvos_h' = (pendingInvos_h \cup {<<(req_h.uniqueId), sender["head"]>>})
-               /\ pc' = [pc EXCEPT !["head"] = "listen_h"]
-               /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, gateway, 
-                               req_h, sender_h, req_t, sender_t, 
-                               pendingInvos_t, req, sender, pendingInvos >>
+apportionQ_h == /\ pc["head"] = "apportionQ_h"
+                /\ msgQs' = [msgQs EXCEPT ![<<head, tail>>] = Append(@, req_h)]
+                /\ pendingInvos_h' = (pendingInvos_h \cup {<<(req_h.uniqueId), sender_h>>})
+                /\ pc' = [pc EXCEPT !["head"] = "listen_h"]
+                /\ UNCHANGED << objLogs, timeOracle, uniqueId, msg, gateway, 
+                                req_h, sender_h, req_t, sender_t, 
+                                pendingInvos_t, req, sender, pendingInvos >>
 
 respFromHead == /\ pc["head"] = "respFromHead"
                 /\ msgQs' = [msgQs EXCEPT ![<<head, sender_h>>] = Append(@, ([    callType |-> READ_RESP,
@@ -502,7 +650,7 @@ respToClient == /\ pc["head"] = "respToClient"
                                 req_h, sender_h, req_t, sender_t, 
                                 pendingInvos_t, req, sender, pendingInvos >>
 
-he == listen_h \/ incomingMsg_h \/ apportionQ_ \/ respFromHead
+he == listen_h \/ incomingMsg_h \/ apportionQ_h \/ respFromHead
          \/ fwdFromTail_h \/ propagate_h \/ respToClient
 
 listen_t == /\ pc["tail"] = "listen_t"
@@ -638,25 +786,30 @@ Spec == /\ Init /\ [][Next]_vars
 
 \* END TRANSLATION 
 
-TypeInvariant == TRUE
-\*TypeInvariant ==    /\ msgQs \in [Network -> {<< >>} \cup Seq(RequestType)]
-\*                    /\ objLogs \in [Nodes -> [Objects -> {<< >>} \cup Seq(ObjectVersionType)]]
-\*                    /\ timeOracle \in Nat
-\*                    /\ uniqueId \in [Clients -> UniqueIdType]
-\*                    /\ msg \in [Clients -> RequestType \cup {NullReq}]
-\*                    /\ gateway \in [Clients -> Nodes \cup {NullNode}] 
-\*                    /\ req \in [Nodes \ {head, tail} -> RequestType \cup {NullReq}]
-\*                    /\ sender \in [Nodes \ {head, tail} -> Nodes \cup {NullNode}]
-\*                    /\ req_h \in RequestType \cup {NullReq}
-\*                    /\ sender_h \in Nodes \cup {NullNode}
-\*                    /\ req_t \in RequestType \cup {NullReq}
-\*                    /\ sender_t \in Nodes \cup {NullNode}
+
+GlobalTypeInvariant ==  /\ msgQs \in [Network -> {<< >>} \cup Seq(RequestType)]
+                        /\ objLogs \in [Nodes -> [Objects -> {<< >>} \cup Seq(ObjectVersionType)]]
+                        /\ timeOracle \in Nat
+
+ClientTypeInvariant ==  /\ uniqueId \in [Clients -> UniqueIdType]
+                        /\ msg \in [Clients -> RequestType \cup {NullReq}]
+                        /\ gateway \in [Clients -> Nodes \cup {NullNode}]
+                        
+NodeTypeInvariant ==    /\ req \in [Nodes \ {head, tail} -> RequestType \cup {NullReq}]
+                        /\ sender \in [Nodes \ {head, tail} -> Nodes \cup {NullNode}]
+\*                        /\ pendingInvos \in [Nodes -> thisoneshard
+                        
+HeadTypeInvariant ==    /\ req_h \in RequestType \cup {NullReq}
+                        /\ sender_h \in Nodes \cup Clients \cup {NullNode}
+                        
+TailTypeInvariant ==    /\ req_t \in RequestType \cup {NullReq}
+                        /\ sender_t \in Nodes \cup Clients \cup {NullNode}
                     
-\*                    /\ pendingInvos \in [Nodes -> thisoneshard
+
 
 
 =============================================================================
 \* Modification History
+\* Last modified Thu Jun 15 15:19:09 EDT 2023 by jenniferlam
 \* Last modified Thu Jun 15 01:26:22 EDT 2023 by 72jen
-\* Last modified Wed Jun 14 16:32:20 EDT 2023 by jenniferlam
 \* Created Tue Jun 13 12:56:59 EDT 2023 by jenniferlam

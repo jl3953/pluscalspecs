@@ -42,7 +42,6 @@ WRITE == "WRITE"
 Actions == {READ, WRITE}
 
 
-
 OperationType == [obj: Objects, uniqueId: UniqueIds, action: Actions]
 LogEntryType == [uniqueId: UniqueIds, isDirty: {TRUE, FALSE}]
 
@@ -794,6 +793,6 @@ PrefixInvariant == \A node \in Nodes \ {tail}: \A o \in Objects:
                         LET successor == Successors[node] IN IsPrefix(allObjLogs[node][o], allObjLogs[succ][o])
 =============================================================================
 \* Modification History
-\* Last modified Tue Jun 13 12:56:18 EDT 2023 by jenniferlam
+\* Last modified Thu Jun 15 14:36:53 EDT 2023 by jenniferlam
 \* Last modified Fri Jun 02 18:58:13 EDT 2023 by 72jen
 \* Created Thu May 25 11:58:00 EDT 2023 by jenniferlam
