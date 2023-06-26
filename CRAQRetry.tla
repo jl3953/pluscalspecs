@@ -89,15 +89,12 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
     \* declaration of global algorithms
     variables   msgQs = [edge \in Network |-> << >>], \* in-order delivery via TCP
                 objLogs = [n \in Nodes |-> [o \in Objects |-> << >>]],
-\*                objTotalOrders = [ o \in Objects |-> << >> ],
                 allSubmittedWriteOps = [o \in Objects |-> {}],
                 allSubmittedReadOps = [ o \in Objects |-> {}],
                 terminatedYet = [c \in Clients |-> FALSE],
-\*                initClient = CHOOSE c \in Clients: TRUE,
                 nonInitClients = Clients \ {initClient},
                 start = FALSE,
-                timeOracle = 10,
-                isLinearizable = TRUE;
+                timeOracle = 10;
                 
     \* operator definitions
     define {
@@ -230,38 +227,6 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
             addToOpSet(msg_cinit); 
             recvdOps_init := recvdOps_init + 1;
         };
-\*        
-\*        wait1: with (temp \in {s \in SendersTo(initClient): msgQs[<<s, initClient>>] /= << >>}) {
-\*            gateway_cinit := temp;
-\*        };
-\*        when msgQs[<<gateway_cinit, initClient>>] /= << >>;
-\*        recv(gateway_cinit, initClient, msg_cinit);
-\*        addToOpSet(msg_cinit);
-\*        recvdOps_init := recvdOps_init + 1;
-\*        
-\*        wait2: with (temp \in {s \in SendersTo(initClient): msgQs[<<s, initClient>>] /= << >>}) {
-\*            gateway_cinit := temp;
-\*        };
-\*        when msgQs[<<gateway_cinit, initClient>>] /= << >>;
-\*        recv(gateway_cinit, initClient, msg_cinit);
-\*        addToOpSet(msg_cinit);
-\*        recvdOps_init := recvdOps_init + 1;
-\*        
-\*        wait3: with (temp \in {s \in SendersTo(initClient): msgQs[<<s, initClient>>] /= << >>}) {
-\*            gateway_cinit := temp;
-\*        };
-\*        when msgQs[<<gateway_cinit, initClient>>] /= << >>;
-\*        recv(gateway_cinit, initClient, msg_cinit);
-\*        addToOpSet(msg_cinit);
-\*        recvdOps_init := recvdOps_init + 1;
-\*        
-\*        wait4: with (temp \in {s \in SendersTo(initClient): msgQs[<<s, initClient>>] /= << >>}) {
-\*            gateway_cinit := temp;
-\*        };
-\*        when msgQs[<<gateway_cinit, initClient>>] /= << >>;
-\*        recv(gateway_cinit, initClient, msg_cinit);
-\*        addToOpSet(msg_cinit);
-\*        recvdOps_init := recvdOps_init + 1;
         
         terminate_init: terminatedYet[initClient] := TRUE
     }
@@ -351,7 +316,6 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                                             startTs |-> timeOracle,
                                             commitTs |-> timeOracle,
                                             op |-> Read(head, req_h.op.obj)];
-\*                    objTotalOrders[req_h.op.obj] := Cons(req_h, @);
                     send(head, sender_h, req_h);
                 }
             } else {
@@ -400,7 +364,6 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                                         startTs |-> now_t,
                                         commitTs |-> now_t,
                                         op |-> Read(tail, req_t.op.obj)];
-\*                objTotalOrders[req_t.op.obj] := Cons(req_t, @);
                 send(tail, sender_t, req_t);
             } else { \* WRITE_INV
                 now_t := timeOracle;
@@ -412,7 +375,6 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                                             startTs |-> req_t.startTs,
                                             commitTs |-> Read(tail, req_t.op.obj).writeCommitTs,
                                             op |-> Read(tail, req_t.op.obj)];
-\*                objTotalOrders[req_t.op.obj] := Cons(req_t, @);
                 send(tail, Predecessors[tail], req_t);   
             }
         }
@@ -445,7 +407,6 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                                         startTs |-> now,
                                         commitTs |-> now,
                                         op |-> Read(self, req.op.obj)];
-\*                    objTotalOrders[req.op.obj] := Cons(req, @);
                     send(self, sender, req);
                 } 
             } else {
@@ -469,57 +430,12 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
             }  
         }
     }
-\*    fair process(perObj \in Objects)
-\*        variables   submittedOps = {},
-\*                    writes = {},
-\*                    reads = {},
-\*                    read = NullReq,
-\*                    edges = {},
-\*                    clients = Clients,
-\*                    match = NullReq,
-\*                    cli = NullClient;
-\*    {
-\*        \* runs at the end
-\*        awaitTermination: while (clients /= {}) {
-\*            cli := CHOOSE cl \in clients : TRUE;
-\*            clients := clients \ {cli};
-\*            await terminatedYet[cli] = TRUE;
-\*        };
-\*        
-\*        writes := allSubmittedWriteOps[self];
-\*        edges := {edge \in {<<w1, w2>> : w1, w2 \in writes}: edge[1].commitTs < edge[2].startTs};
-\*
-\*        reads := allSubmittedReadOps[self];
-\*        addVToG: while (reads /= {}) {
-\*            read := CHOOSE r \in reads: TRUE;
-\*            reads := reads \ {read};
-\*            
-\*            \* add_to_graph(read)
-\*            edges := edges \cup {<<write, read>>: write \in {w \in writes: w.commitTs < read.startTs}}; 
-\*            
-\*            \* find_matched_write(read)
-\*            match := CHOOSE w \in writes: w.uniqueId = read.op.uniqueId;
-\*            
-\*            \* merge_read_into_write(read, match)
-\*            merge_read_into_write: 
-\*            edges := edges \cup { <<write, match>>: write \in {w \in writes: w.commitTs < read.startTs}};
-\*            removeSelfEdges: 
-\*            edges := edges \ {e \in edges: e[1] = e[2]}; 
-\*            
-\*            \* check for cycles
-\*            if (\E e \in edges: <<e[2], e[1]>> \in edges) {
-\*                isLinearizable := FALSE
-\*            }
-\*            
-\*        }
-\*    }
 }
 
 ****************************************************************************)
-\* BEGIN TRANSLATION (chksum(pcal) = "81c38768" /\ chksum(tla) = "95be2803")
+\* BEGIN TRANSLATION (chksum(pcal) = "36c979e5" /\ chksum(tla) = "362f3a2")
 VARIABLES msgQs, objLogs, allSubmittedWriteOps, allSubmittedReadOps, 
-          terminatedYet, nonInitClients, start, timeOracle, isLinearizable, 
-          pc
+          terminatedYet, nonInitClients, start, timeOracle, pc
 
 (* define statement *)
 RECURSIVE CommitDirtyVersion(_, _)
@@ -549,8 +465,8 @@ VARIABLES uninitializedObjs, initObj, objs_init, obj_init, actions_init,
           pendingInvos
 
 vars == << msgQs, objLogs, allSubmittedWriteOps, allSubmittedReadOps, 
-           terminatedYet, nonInitClients, start, timeOracle, isLinearizable, 
-           pc, uninitializedObjs, initObj, objs_init, obj_init, actions_init, 
+           terminatedYet, nonInitClients, start, timeOracle, pc, 
+           uninitializedObjs, initObj, objs_init, obj_init, actions_init, 
            action_init, gateway_cinit, msg_cinit, uniqueId_cinit, 
            sentOps_init, recvdOps_init, objs, obj, actions, action, gateway_c, 
            msg_c, uniqueId, sentOps, recvdOps, req_h, sender_h, 
@@ -568,7 +484,6 @@ Init == (* Global variables *)
         /\ nonInitClients = Clients \ {initClient}
         /\ start = FALSE
         /\ timeOracle = 10
-        /\ isLinearizable = TRUE
         (* Process iclient *)
         /\ uninitializedObjs = Objects
         /\ initObj = NullObj
@@ -634,15 +549,14 @@ initializeObj == /\ pc["initClient"] = "initializeObj"
                                             uniqueId_cinit >>
                  /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                                  allSubmittedReadOps, terminatedYet, 
-                                 nonInitClients, timeOracle, isLinearizable, 
-                                 objs_init, obj_init, actions_init, 
-                                 action_init, gateway_cinit, msg_cinit, 
-                                 sentOps_init, recvdOps_init, objs, obj, 
-                                 actions, action, gateway_c, msg_c, uniqueId, 
-                                 sentOps, recvdOps, req_h, sender_h, 
-                                 pendingInvos_h, now_h, req_t, sender_t, 
-                                 pendingInvos_t, now_t, req, sender, now, 
-                                 pendingInvos >>
+                                 nonInitClients, timeOracle, objs_init, 
+                                 obj_init, actions_init, action_init, 
+                                 gateway_cinit, msg_cinit, sentOps_init, 
+                                 recvdOps_init, objs, obj, actions, action, 
+                                 gateway_c, msg_c, uniqueId, sentOps, recvdOps, 
+                                 req_h, sender_h, pendingInvos_h, now_h, req_t, 
+                                 sender_t, pendingInvos_t, now_t, req, sender, 
+                                 now, pendingInvos >>
 
 waitFor_init == /\ pc["initClient"] = "waitFor_init"
                 /\ msgQs[<<head, initClient>>] /= << >>
@@ -655,15 +569,14 @@ waitFor_init == /\ pc["initClient"] = "waitFor_init"
                            /\ UNCHANGED allSubmittedWriteOps
                 /\ pc' = [pc EXCEPT !["initClient"] = "initializeObj"]
                 /\ UNCHANGED << objLogs, terminatedYet, nonInitClients, start, 
-                                timeOracle, isLinearizable, uninitializedObjs, 
-                                initObj, objs_init, obj_init, actions_init, 
-                                action_init, gateway_cinit, uniqueId_cinit, 
-                                sentOps_init, recvdOps_init, objs, obj, 
-                                actions, action, gateway_c, msg_c, uniqueId, 
-                                sentOps, recvdOps, req_h, sender_h, 
-                                pendingInvos_h, now_h, req_t, sender_t, 
-                                pendingInvos_t, now_t, req, sender, now, 
-                                pendingInvos >>
+                                timeOracle, uninitializedObjs, initObj, 
+                                objs_init, obj_init, actions_init, action_init, 
+                                gateway_cinit, uniqueId_cinit, sentOps_init, 
+                                recvdOps_init, objs, obj, actions, action, 
+                                gateway_c, msg_c, uniqueId, sentOps, recvdOps, 
+                                req_h, sender_h, pendingInvos_h, now_h, req_t, 
+                                sender_t, pendingInvos_t, now_t, req, sender, 
+                                now, pendingInvos >>
 
 concurrentOps_init == /\ pc["initClient"] = "concurrentOps_init"
                       /\ IF objs_init /= {}
@@ -677,15 +590,14 @@ concurrentOps_init == /\ pc["initClient"] = "concurrentOps_init"
                       /\ UNCHANGED << msgQs, objLogs, allSubmittedWriteOps, 
                                       allSubmittedReadOps, terminatedYet, 
                                       nonInitClients, start, timeOracle, 
-                                      isLinearizable, uninitializedObjs, 
-                                      initObj, action_init, gateway_cinit, 
-                                      msg_cinit, uniqueId_cinit, sentOps_init, 
-                                      recvdOps_init, objs, obj, actions, 
-                                      action, gateway_c, msg_c, uniqueId, 
-                                      sentOps, recvdOps, req_h, sender_h, 
-                                      pendingInvos_h, now_h, req_t, sender_t, 
-                                      pendingInvos_t, now_t, req, sender, now, 
-                                      pendingInvos >>
+                                      uninitializedObjs, initObj, action_init, 
+                                      gateway_cinit, msg_cinit, uniqueId_cinit, 
+                                      sentOps_init, recvdOps_init, objs, obj, 
+                                      actions, action, gateway_c, msg_c, 
+                                      uniqueId, sentOps, recvdOps, req_h, 
+                                      sender_h, pendingInvos_h, now_h, req_t, 
+                                      sender_t, pendingInvos_t, now_t, req, 
+                                      sender, now, pendingInvos >>
 
 readOrWrite_init == /\ pc["initClient"] = "readOrWrite_init"
                     /\ IF actions_init /= {}
@@ -712,14 +624,13 @@ readOrWrite_init == /\ pc["initClient"] = "readOrWrite_init"
                     /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                                     allSubmittedReadOps, terminatedYet, 
                                     nonInitClients, start, timeOracle, 
-                                    isLinearizable, uninitializedObjs, initObj, 
-                                    objs_init, obj_init, gateway_cinit, 
-                                    msg_cinit, recvdOps_init, objs, obj, 
-                                    actions, action, gateway_c, msg_c, 
-                                    uniqueId, sentOps, recvdOps, req_h, 
-                                    sender_h, pendingInvos_h, now_h, req_t, 
-                                    sender_t, pendingInvos_t, now_t, req, 
-                                    sender, now, pendingInvos >>
+                                    uninitializedObjs, initObj, objs_init, 
+                                    obj_init, gateway_cinit, msg_cinit, 
+                                    recvdOps_init, objs, obj, actions, action, 
+                                    gateway_c, msg_c, uniqueId, sentOps, 
+                                    recvdOps, req_h, sender_h, pendingInvos_h, 
+                                    now_h, req_t, sender_t, pendingInvos_t, 
+                                    now_t, req, sender, now, pendingInvos >>
 
 waitForOps_init == /\ pc["initClient"] = "waitForOps_init"
                    /\ IF recvdOps_init < sentOps_init
@@ -741,28 +652,26 @@ waitForOps_init == /\ pc["initClient"] = "waitForOps_init"
                                               gateway_cinit, msg_cinit, 
                                               recvdOps_init >>
                    /\ UNCHANGED << objLogs, terminatedYet, nonInitClients, 
-                                   start, timeOracle, isLinearizable, 
-                                   uninitializedObjs, initObj, objs_init, 
-                                   obj_init, actions_init, action_init, 
-                                   uniqueId_cinit, sentOps_init, objs, obj, 
-                                   actions, action, gateway_c, msg_c, uniqueId, 
-                                   sentOps, recvdOps, req_h, sender_h, 
-                                   pendingInvos_h, now_h, req_t, sender_t, 
-                                   pendingInvos_t, now_t, req, sender, now, 
-                                   pendingInvos >>
+                                   start, timeOracle, uninitializedObjs, 
+                                   initObj, objs_init, obj_init, actions_init, 
+                                   action_init, uniqueId_cinit, sentOps_init, 
+                                   objs, obj, actions, action, gateway_c, 
+                                   msg_c, uniqueId, sentOps, recvdOps, req_h, 
+                                   sender_h, pendingInvos_h, now_h, req_t, 
+                                   sender_t, pendingInvos_t, now_t, req, 
+                                   sender, now, pendingInvos >>
 
 terminate_init == /\ pc["initClient"] = "terminate_init"
                   /\ terminatedYet' = [terminatedYet EXCEPT ![initClient] = TRUE]
                   /\ pc' = [pc EXCEPT !["initClient"] = "Done"]
                   /\ UNCHANGED << msgQs, objLogs, allSubmittedWriteOps, 
                                   allSubmittedReadOps, nonInitClients, start, 
-                                  timeOracle, isLinearizable, 
-                                  uninitializedObjs, initObj, objs_init, 
-                                  obj_init, actions_init, action_init, 
-                                  gateway_cinit, msg_cinit, uniqueId_cinit, 
-                                  sentOps_init, recvdOps_init, objs, obj, 
-                                  actions, action, gateway_c, msg_c, uniqueId, 
-                                  sentOps, recvdOps, req_h, sender_h, 
+                                  timeOracle, uninitializedObjs, initObj, 
+                                  objs_init, obj_init, actions_init, 
+                                  action_init, gateway_cinit, msg_cinit, 
+                                  uniqueId_cinit, sentOps_init, recvdOps_init, 
+                                  objs, obj, actions, action, gateway_c, msg_c, 
+                                  uniqueId, sentOps, recvdOps, req_h, sender_h, 
                                   pendingInvos_h, now_h, req_t, sender_t, 
                                   pendingInvos_t, now_t, req, sender, now, 
                                   pendingInvos >>
@@ -776,15 +685,15 @@ waitForInit(self) == /\ pc[self] = "waitForInit"
                      /\ UNCHANGED << msgQs, objLogs, allSubmittedWriteOps, 
                                      allSubmittedReadOps, terminatedYet, 
                                      nonInitClients, start, timeOracle, 
-                                     isLinearizable, uninitializedObjs, 
-                                     initObj, objs_init, obj_init, 
-                                     actions_init, action_init, gateway_cinit, 
-                                     msg_cinit, uniqueId_cinit, sentOps_init, 
-                                     recvdOps_init, objs, obj, actions, action, 
-                                     gateway_c, msg_c, uniqueId, sentOps, 
-                                     recvdOps, req_h, sender_h, pendingInvos_h, 
-                                     now_h, req_t, sender_t, pendingInvos_t, 
-                                     now_t, req, sender, now, pendingInvos >>
+                                     uninitializedObjs, initObj, objs_init, 
+                                     obj_init, actions_init, action_init, 
+                                     gateway_cinit, msg_cinit, uniqueId_cinit, 
+                                     sentOps_init, recvdOps_init, objs, obj, 
+                                     actions, action, gateway_c, msg_c, 
+                                     uniqueId, sentOps, recvdOps, req_h, 
+                                     sender_h, pendingInvos_h, now_h, req_t, 
+                                     sender_t, pendingInvos_t, now_t, req, 
+                                     sender, now, pendingInvos >>
 
 concurrentOps(self) == /\ pc[self] = "concurrentOps"
                        /\ IF objs[self] /= {}
@@ -796,9 +705,8 @@ concurrentOps(self) == /\ pc[self] = "concurrentOps"
                        /\ UNCHANGED << msgQs, objLogs, allSubmittedWriteOps, 
                                        allSubmittedReadOps, terminatedYet, 
                                        nonInitClients, start, timeOracle, 
-                                       isLinearizable, uninitializedObjs, 
-                                       initObj, objs_init, obj_init, 
-                                       actions_init, action_init, 
+                                       uninitializedObjs, initObj, objs_init, 
+                                       obj_init, actions_init, action_init, 
                                        gateway_cinit, msg_cinit, 
                                        uniqueId_cinit, sentOps_init, 
                                        recvdOps_init, actions, action, 
@@ -833,15 +741,14 @@ readOrWrite(self) == /\ pc[self] = "readOrWrite"
                      /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                                      allSubmittedReadOps, terminatedYet, 
                                      nonInitClients, start, timeOracle, 
-                                     isLinearizable, uninitializedObjs, 
-                                     initObj, objs_init, obj_init, 
-                                     actions_init, action_init, gateway_cinit, 
-                                     msg_cinit, uniqueId_cinit, sentOps_init, 
-                                     recvdOps_init, objs, obj, gateway_c, 
-                                     msg_c, recvdOps, req_h, sender_h, 
-                                     pendingInvos_h, now_h, req_t, sender_t, 
-                                     pendingInvos_t, now_t, req, sender, now, 
-                                     pendingInvos >>
+                                     uninitializedObjs, initObj, objs_init, 
+                                     obj_init, actions_init, action_init, 
+                                     gateway_cinit, msg_cinit, uniqueId_cinit, 
+                                     sentOps_init, recvdOps_init, objs, obj, 
+                                     gateway_c, msg_c, recvdOps, req_h, 
+                                     sender_h, pendingInvos_h, now_h, req_t, 
+                                     sender_t, pendingInvos_t, now_t, req, 
+                                     sender, now, pendingInvos >>
 
 waitForOps(self) == /\ pc[self] = "waitForOps"
                     /\ IF recvdOps[self] < sentOps[self]
@@ -856,7 +763,7 @@ waitForOps(self) == /\ pc[self] = "waitForOps"
                                      ELSE /\ allSubmittedReadOps' = [allSubmittedReadOps EXCEPT ![msg_c'[self].op.obj] = allSubmittedReadOps[msg_c'[self].op.obj] \cup {msg_c'[self]}]
                                           /\ UNCHANGED allSubmittedWriteOps
                                /\ Assert((msg_c'[self].uniqueId[1] = self), 
-                                         "Failure of assertion at line 319, column 13.")
+                                         "Failure of assertion at line 284, column 13.")
                                /\ recvdOps' = [recvdOps EXCEPT ![self] = recvdOps[self] + 1]
                                /\ pc' = [pc EXCEPT ![self] = "waitForOps"]
                           ELSE /\ pc' = [pc EXCEPT ![self] = "terminate"]
@@ -864,31 +771,30 @@ waitForOps(self) == /\ pc[self] = "waitForOps"
                                                allSubmittedReadOps, gateway_c, 
                                                msg_c, recvdOps >>
                     /\ UNCHANGED << objLogs, terminatedYet, nonInitClients, 
-                                    start, timeOracle, isLinearizable, 
-                                    uninitializedObjs, initObj, objs_init, 
-                                    obj_init, actions_init, action_init, 
-                                    gateway_cinit, msg_cinit, uniqueId_cinit, 
-                                    sentOps_init, recvdOps_init, objs, obj, 
-                                    actions, action, uniqueId, sentOps, req_h, 
-                                    sender_h, pendingInvos_h, now_h, req_t, 
-                                    sender_t, pendingInvos_t, now_t, req, 
-                                    sender, now, pendingInvos >>
+                                    start, timeOracle, uninitializedObjs, 
+                                    initObj, objs_init, obj_init, actions_init, 
+                                    action_init, gateway_cinit, msg_cinit, 
+                                    uniqueId_cinit, sentOps_init, 
+                                    recvdOps_init, objs, obj, actions, action, 
+                                    uniqueId, sentOps, req_h, sender_h, 
+                                    pendingInvos_h, now_h, req_t, sender_t, 
+                                    pendingInvos_t, now_t, req, sender, now, 
+                                    pendingInvos >>
 
 terminate(self) == /\ pc[self] = "terminate"
                    /\ terminatedYet' = [terminatedYet EXCEPT ![self] = TRUE]
                    /\ pc' = [pc EXCEPT ![self] = "Done"]
                    /\ UNCHANGED << msgQs, objLogs, allSubmittedWriteOps, 
                                    allSubmittedReadOps, nonInitClients, start, 
-                                   timeOracle, isLinearizable, 
-                                   uninitializedObjs, initObj, objs_init, 
-                                   obj_init, actions_init, action_init, 
-                                   gateway_cinit, msg_cinit, uniqueId_cinit, 
-                                   sentOps_init, recvdOps_init, objs, obj, 
-                                   actions, action, gateway_c, msg_c, uniqueId, 
-                                   sentOps, recvdOps, req_h, sender_h, 
-                                   pendingInvos_h, now_h, req_t, sender_t, 
-                                   pendingInvos_t, now_t, req, sender, now, 
-                                   pendingInvos >>
+                                   timeOracle, uninitializedObjs, initObj, 
+                                   objs_init, obj_init, actions_init, 
+                                   action_init, gateway_cinit, msg_cinit, 
+                                   uniqueId_cinit, sentOps_init, recvdOps_init, 
+                                   objs, obj, actions, action, gateway_c, 
+                                   msg_c, uniqueId, sentOps, recvdOps, req_h, 
+                                   sender_h, pendingInvos_h, now_h, req_t, 
+                                   sender_t, pendingInvos_t, now_t, req, 
+                                   sender, now, pendingInvos >>
 
 c(self) == waitForInit(self) \/ concurrentOps(self) \/ readOrWrite(self)
               \/ waitForOps(self) \/ terminate(self)
@@ -920,14 +826,13 @@ listen_h == /\ pc["head"] = "listen_h"
                                              /\ UNCHANGED << timeOracle, now_h >>
             /\ UNCHANGED << allSubmittedWriteOps, allSubmittedReadOps, 
                             terminatedYet, nonInitClients, start, 
-                            isLinearizable, uninitializedObjs, initObj, 
-                            objs_init, obj_init, actions_init, action_init, 
-                            gateway_cinit, msg_cinit, uniqueId_cinit, 
-                            sentOps_init, recvdOps_init, objs, obj, actions, 
-                            action, gateway_c, msg_c, uniqueId, sentOps, 
-                            recvdOps, pendingInvos_h, req_t, sender_t, 
-                            pendingInvos_t, now_t, req, sender, now, 
-                            pendingInvos >>
+                            uninitializedObjs, initObj, objs_init, obj_init, 
+                            actions_init, action_init, gateway_cinit, 
+                            msg_cinit, uniqueId_cinit, sentOps_init, 
+                            recvdOps_init, objs, obj, actions, action, 
+                            gateway_c, msg_c, uniqueId, sentOps, recvdOps, 
+                            pendingInvos_h, req_t, sender_t, pendingInvos_t, 
+                            now_t, req, sender, now, pendingInvos >>
 
 apportionQ_h == /\ pc["head"] = "apportionQ_h"
                 /\ msgQs' = [msgQs EXCEPT ![<<head, tail>>] = Append(@, req_h)]
@@ -936,8 +841,8 @@ apportionQ_h == /\ pc["head"] = "apportionQ_h"
                 /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                                 allSubmittedReadOps, terminatedYet, 
                                 nonInitClients, start, timeOracle, 
-                                isLinearizable, uninitializedObjs, initObj, 
-                                objs_init, obj_init, actions_init, action_init, 
+                                uninitializedObjs, initObj, objs_init, 
+                                obj_init, actions_init, action_init, 
                                 gateway_cinit, msg_cinit, uniqueId_cinit, 
                                 sentOps_init, recvdOps_init, objs, obj, 
                                 actions, action, gateway_c, msg_c, uniqueId, 
@@ -956,8 +861,8 @@ respFromHead == /\ pc["head"] = "respFromHead"
                 /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                                 allSubmittedReadOps, terminatedYet, 
                                 nonInitClients, start, timeOracle, 
-                                isLinearizable, uninitializedObjs, initObj, 
-                                objs_init, obj_init, actions_init, action_init, 
+                                uninitializedObjs, initObj, objs_init, 
+                                obj_init, actions_init, action_init, 
                                 gateway_cinit, msg_cinit, uniqueId_cinit, 
                                 sentOps_init, recvdOps_init, objs, obj, 
                                 actions, action, gateway_c, msg_c, uniqueId, 
@@ -972,14 +877,14 @@ readResp_h == /\ pc["head"] = "readResp_h"
               /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                               allSubmittedReadOps, terminatedYet, 
                               nonInitClients, start, timeOracle, 
-                              isLinearizable, uninitializedObjs, initObj, 
-                              objs_init, obj_init, actions_init, action_init, 
-                              gateway_cinit, msg_cinit, uniqueId_cinit, 
-                              sentOps_init, recvdOps_init, objs, obj, actions, 
-                              action, gateway_c, msg_c, uniqueId, sentOps, 
-                              recvdOps, req_h, sender_h, now_h, req_t, 
-                              sender_t, pendingInvos_t, now_t, req, sender, 
-                              now, pendingInvos >>
+                              uninitializedObjs, initObj, objs_init, obj_init, 
+                              actions_init, action_init, gateway_cinit, 
+                              msg_cinit, uniqueId_cinit, sentOps_init, 
+                              recvdOps_init, objs, obj, actions, action, 
+                              gateway_c, msg_c, uniqueId, sentOps, recvdOps, 
+                              req_h, sender_h, now_h, req_t, sender_t, 
+                              pendingInvos_t, now_t, req, sender, now, 
+                              pendingInvos >>
 
 dirtyWrite_h == /\ pc["head"] = "dirtyWrite_h"
                 /\ req_h' = [req_h EXCEPT    !.startTs = now_h,
@@ -991,14 +896,14 @@ dirtyWrite_h == /\ pc["head"] = "dirtyWrite_h"
                 /\ pc' = [pc EXCEPT !["head"] = "listen_h"]
                 /\ UNCHANGED << allSubmittedWriteOps, allSubmittedReadOps, 
                                 terminatedYet, nonInitClients, start, 
-                                timeOracle, isLinearizable, uninitializedObjs, 
-                                initObj, objs_init, obj_init, actions_init, 
-                                action_init, gateway_cinit, msg_cinit, 
-                                uniqueId_cinit, sentOps_init, recvdOps_init, 
-                                objs, obj, actions, action, gateway_c, msg_c, 
-                                uniqueId, sentOps, recvdOps, sender_h, now_h, 
-                                req_t, sender_t, pendingInvos_t, now_t, req, 
-                                sender, now, pendingInvos >>
+                                timeOracle, uninitializedObjs, initObj, 
+                                objs_init, obj_init, actions_init, action_init, 
+                                gateway_cinit, msg_cinit, uniqueId_cinit, 
+                                sentOps_init, recvdOps_init, objs, obj, 
+                                actions, action, gateway_c, msg_c, uniqueId, 
+                                sentOps, recvdOps, sender_h, now_h, req_t, 
+                                sender_t, pendingInvos_t, now_t, req, sender, 
+                                now, pendingInvos >>
 
 respToClient == /\ pc["head"] = "respToClient"
                 /\ msgQs' = [msgQs EXCEPT ![<<head, (Find(pendingInvos_h, req_h.uniqueId))>>] = Append(@, req_h)]
@@ -1007,8 +912,8 @@ respToClient == /\ pc["head"] = "respToClient"
                 /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                                 allSubmittedReadOps, terminatedYet, 
                                 nonInitClients, start, timeOracle, 
-                                isLinearizable, uninitializedObjs, initObj, 
-                                objs_init, obj_init, actions_init, action_init, 
+                                uninitializedObjs, initObj, objs_init, 
+                                obj_init, actions_init, action_init, 
                                 gateway_cinit, msg_cinit, uniqueId_cinit, 
                                 sentOps_init, recvdOps_init, objs, obj, 
                                 actions, action, gateway_c, msg_c, uniqueId, 
@@ -1038,12 +943,12 @@ listen_t == /\ pc["tail"] = "listen_t"
                        /\ pc' = [pc EXCEPT !["tail"] = "tailAck"]
             /\ UNCHANGED << allSubmittedWriteOps, allSubmittedReadOps, 
                             terminatedYet, nonInitClients, start, 
-                            isLinearizable, uninitializedObjs, initObj, 
-                            objs_init, obj_init, actions_init, action_init, 
-                            gateway_cinit, msg_cinit, uniqueId_cinit, 
-                            sentOps_init, recvdOps_init, objs, obj, actions, 
-                            action, gateway_c, msg_c, uniqueId, sentOps, 
-                            recvdOps, req_h, sender_h, pendingInvos_h, now_h, 
+                            uninitializedObjs, initObj, objs_init, obj_init, 
+                            actions_init, action_init, gateway_cinit, 
+                            msg_cinit, uniqueId_cinit, sentOps_init, 
+                            recvdOps_init, objs, obj, actions, action, 
+                            gateway_c, msg_c, uniqueId, sentOps, recvdOps, 
+                            req_h, sender_h, pendingInvos_h, now_h, 
                             pendingInvos_t, req, sender, now, pendingInvos >>
 
 respFromSelf_t == /\ pc["tail"] = "respFromSelf_t"
@@ -1057,12 +962,12 @@ respFromSelf_t == /\ pc["tail"] = "respFromSelf_t"
                   /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                                   allSubmittedReadOps, terminatedYet, 
                                   nonInitClients, start, timeOracle, 
-                                  isLinearizable, uninitializedObjs, initObj, 
-                                  objs_init, obj_init, actions_init, 
-                                  action_init, gateway_cinit, msg_cinit, 
-                                  uniqueId_cinit, sentOps_init, recvdOps_init, 
-                                  objs, obj, actions, action, gateway_c, msg_c, 
-                                  uniqueId, sentOps, recvdOps, req_h, sender_h, 
+                                  uninitializedObjs, initObj, objs_init, 
+                                  obj_init, actions_init, action_init, 
+                                  gateway_cinit, msg_cinit, uniqueId_cinit, 
+                                  sentOps_init, recvdOps_init, objs, obj, 
+                                  actions, action, gateway_c, msg_c, uniqueId, 
+                                  sentOps, recvdOps, req_h, sender_h, 
                                   pendingInvos_h, now_h, sender_t, 
                                   pendingInvos_t, now_t, req, sender, now, 
                                   pendingInvos >>
@@ -1077,14 +982,13 @@ tailAck == /\ pc["tail"] = "tailAck"
            /\ pc' = [pc EXCEPT !["tail"] = "listen_t"]
            /\ UNCHANGED << objLogs, allSubmittedWriteOps, allSubmittedReadOps, 
                            terminatedYet, nonInitClients, start, timeOracle, 
-                           isLinearizable, uninitializedObjs, initObj, 
-                           objs_init, obj_init, actions_init, action_init, 
-                           gateway_cinit, msg_cinit, uniqueId_cinit, 
-                           sentOps_init, recvdOps_init, objs, obj, actions, 
-                           action, gateway_c, msg_c, uniqueId, sentOps, 
-                           recvdOps, req_h, sender_h, pendingInvos_h, now_h, 
-                           sender_t, pendingInvos_t, now_t, req, sender, now, 
-                           pendingInvos >>
+                           uninitializedObjs, initObj, objs_init, obj_init, 
+                           actions_init, action_init, gateway_cinit, msg_cinit, 
+                           uniqueId_cinit, sentOps_init, recvdOps_init, objs, 
+                           obj, actions, action, gateway_c, msg_c, uniqueId, 
+                           sentOps, recvdOps, req_h, sender_h, pendingInvos_h, 
+                           now_h, sender_t, pendingInvos_t, now_t, req, sender, 
+                           now, pendingInvos >>
 
 ta == listen_t \/ respFromSelf_t \/ tailAck
 
@@ -1113,8 +1017,8 @@ listen(self) == /\ pc[self] = "listen"
                            /\ UNCHANGED << timeOracle, now >>
                 /\ UNCHANGED << allSubmittedWriteOps, allSubmittedReadOps, 
                                 terminatedYet, nonInitClients, start, 
-                                isLinearizable, uninitializedObjs, initObj, 
-                                objs_init, obj_init, actions_init, action_init, 
+                                uninitializedObjs, initObj, objs_init, 
+                                obj_init, actions_init, action_init, 
                                 gateway_cinit, msg_cinit, uniqueId_cinit, 
                                 sentOps_init, recvdOps_init, objs, obj, 
                                 actions, action, gateway_c, msg_c, uniqueId, 
@@ -1129,15 +1033,15 @@ apportionQ(self) == /\ pc[self] = "apportionQ"
                     /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                                     allSubmittedReadOps, terminatedYet, 
                                     nonInitClients, start, timeOracle, 
-                                    isLinearizable, uninitializedObjs, initObj, 
-                                    objs_init, obj_init, actions_init, 
-                                    action_init, gateway_cinit, msg_cinit, 
-                                    uniqueId_cinit, sentOps_init, 
-                                    recvdOps_init, objs, obj, actions, action, 
-                                    gateway_c, msg_c, uniqueId, sentOps, 
-                                    recvdOps, req_h, sender_h, pendingInvos_h, 
-                                    now_h, req_t, sender_t, pendingInvos_t, 
-                                    now_t, req, sender, now >>
+                                    uninitializedObjs, initObj, objs_init, 
+                                    obj_init, actions_init, action_init, 
+                                    gateway_cinit, msg_cinit, uniqueId_cinit, 
+                                    sentOps_init, recvdOps_init, objs, obj, 
+                                    actions, action, gateway_c, msg_c, 
+                                    uniqueId, sentOps, recvdOps, req_h, 
+                                    sender_h, pendingInvos_h, now_h, req_t, 
+                                    sender_t, pendingInvos_t, now_t, req, 
+                                    sender, now >>
 
 respFromSelf(self) == /\ pc[self] = "respFromSelf"
                       /\ req' = [req EXCEPT ![self] =   [callType |-> READ_RESP,
@@ -1150,16 +1054,15 @@ respFromSelf(self) == /\ pc[self] = "respFromSelf"
                       /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                                       allSubmittedReadOps, terminatedYet, 
                                       nonInitClients, start, timeOracle, 
-                                      isLinearizable, uninitializedObjs, 
-                                      initObj, objs_init, obj_init, 
-                                      actions_init, action_init, gateway_cinit, 
-                                      msg_cinit, uniqueId_cinit, sentOps_init, 
-                                      recvdOps_init, objs, obj, actions, 
-                                      action, gateway_c, msg_c, uniqueId, 
-                                      sentOps, recvdOps, req_h, sender_h, 
-                                      pendingInvos_h, now_h, req_t, sender_t, 
-                                      pendingInvos_t, now_t, sender, now, 
-                                      pendingInvos >>
+                                      uninitializedObjs, initObj, objs_init, 
+                                      obj_init, actions_init, action_init, 
+                                      gateway_cinit, msg_cinit, uniqueId_cinit, 
+                                      sentOps_init, recvdOps_init, objs, obj, 
+                                      actions, action, gateway_c, msg_c, 
+                                      uniqueId, sentOps, recvdOps, req_h, 
+                                      sender_h, pendingInvos_h, now_h, req_t, 
+                                      sender_t, pendingInvos_t, now_t, sender, 
+                                      now, pendingInvos >>
 
 fwdFromTail(self) == /\ pc[self] = "fwdFromTail"
                      /\ msgQs' = [msgQs EXCEPT ![<<self, (Find(pendingInvos[self], req[self].uniqueId))>>] = Append(@, req[self])]
@@ -1168,15 +1071,15 @@ fwdFromTail(self) == /\ pc[self] = "fwdFromTail"
                      /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                                      allSubmittedReadOps, terminatedYet, 
                                      nonInitClients, start, timeOracle, 
-                                     isLinearizable, uninitializedObjs, 
-                                     initObj, objs_init, obj_init, 
-                                     actions_init, action_init, gateway_cinit, 
-                                     msg_cinit, uniqueId_cinit, sentOps_init, 
-                                     recvdOps_init, objs, obj, actions, action, 
-                                     gateway_c, msg_c, uniqueId, sentOps, 
-                                     recvdOps, req_h, sender_h, pendingInvos_h, 
-                                     now_h, req_t, sender_t, pendingInvos_t, 
-                                     now_t, req, sender, now >>
+                                     uninitializedObjs, initObj, objs_init, 
+                                     obj_init, actions_init, action_init, 
+                                     gateway_cinit, msg_cinit, uniqueId_cinit, 
+                                     sentOps_init, recvdOps_init, objs, obj, 
+                                     actions, action, gateway_c, msg_c, 
+                                     uniqueId, sentOps, recvdOps, req_h, 
+                                     sender_h, pendingInvos_h, now_h, req_t, 
+                                     sender_t, pendingInvos_t, now_t, req, 
+                                     sender, now >>
 
 propagate(self) == /\ pc[self] = "propagate"
                    /\ msgQs' = [msgQs EXCEPT ![<<self, (Successors[self])>>] = Append(@, req[self])]
@@ -1185,15 +1088,14 @@ propagate(self) == /\ pc[self] = "propagate"
                    /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                                    allSubmittedReadOps, terminatedYet, 
                                    nonInitClients, start, timeOracle, 
-                                   isLinearizable, uninitializedObjs, initObj, 
-                                   objs_init, obj_init, actions_init, 
-                                   action_init, gateway_cinit, msg_cinit, 
-                                   uniqueId_cinit, sentOps_init, recvdOps_init, 
-                                   objs, obj, actions, action, gateway_c, 
-                                   msg_c, uniqueId, sentOps, recvdOps, req_h, 
-                                   sender_h, pendingInvos_h, now_h, req_t, 
-                                   sender_t, pendingInvos_t, now_t, req, 
-                                   sender, now >>
+                                   uninitializedObjs, initObj, objs_init, 
+                                   obj_init, actions_init, action_init, 
+                                   gateway_cinit, msg_cinit, uniqueId_cinit, 
+                                   sentOps_init, recvdOps_init, objs, obj, 
+                                   actions, action, gateway_c, msg_c, uniqueId, 
+                                   sentOps, recvdOps, req_h, sender_h, 
+                                   pendingInvos_h, now_h, req_t, sender_t, 
+                                   pendingInvos_t, now_t, req, sender, now >>
 
 backProp(self) == /\ pc[self] = "backProp"
                   /\ msgQs' = [msgQs EXCEPT ![<<self, (Find(pendingInvos[self], req[self].uniqueId))>>] = Append(@, req[self])]
@@ -1202,12 +1104,12 @@ backProp(self) == /\ pc[self] = "backProp"
                   /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                                   allSubmittedReadOps, terminatedYet, 
                                   nonInitClients, start, timeOracle, 
-                                  isLinearizable, uninitializedObjs, initObj, 
-                                  objs_init, obj_init, actions_init, 
-                                  action_init, gateway_cinit, msg_cinit, 
-                                  uniqueId_cinit, sentOps_init, recvdOps_init, 
-                                  objs, obj, actions, action, gateway_c, msg_c, 
-                                  uniqueId, sentOps, recvdOps, req_h, sender_h, 
+                                  uninitializedObjs, initObj, objs_init, 
+                                  obj_init, actions_init, action_init, 
+                                  gateway_cinit, msg_cinit, uniqueId_cinit, 
+                                  sentOps_init, recvdOps_init, objs, obj, 
+                                  actions, action, gateway_c, msg_c, uniqueId, 
+                                  sentOps, recvdOps, req_h, sender_h, 
                                   pendingInvos_h, now_h, req_t, sender_t, 
                                   pendingInvos_t, now_t, req, sender, now >>
 
@@ -1227,11 +1129,6 @@ Spec == /\ Init /\ [][Next]_vars
         /\ \A self \in Nodes \ {head, tail} : WF_vars(n(self))
 
 \* END TRANSLATION 
-
-
-
-
-
 
 GlobalTypeInvariant ==  /\ msgQs \in [Network -> {<< >>} \cup Seq(RequestType)]
                         /\ objLogs \in [Nodes -> [Objects -> {<< >>} \cup Seq(ObjectVersionType)]]
@@ -1264,10 +1161,6 @@ ClientTypeInvariant ==  \*/\ \A objInited \in objs: objInited \in [Clients -> Ob
                         /\ msg_c \in [Clients \ {initClient} -> RequestType \cup {NullReq}]
                         /\ uniqueId \in [Clients \ {initClient} -> UniqueIdType]
 
-\*ClientTypeInvariant ==  /\ uniqueId \in [Clients -> UniqueIdType]
-\*                        /\ msg \in [Clients -> RequestType \cup {NullReq}]
-\*                        /\ gateway \in [Clients -> Nodes \cup {NullNode}]
-
                         
 NodeTypeInvariant ==    /\ req \in [Nodes \ {head, tail} -> RequestType \cup {NullReq}]
                         /\ sender \in [Nodes \ {head, tail} -> Nodes \cup Clients \cup {NullNode}]
@@ -1283,115 +1176,7 @@ TailTypeInvariant ==    /\ req_t \in RequestType \cup {NullReq}
                         /\ sender_t \in Nodes \cup Clients \cup {NullNode}
 \*                        /\ pendingInvos_t \in thisoneshard
                         /\ now_t \in Nat
-                                            
-\*
-\*RECURSIVE MostRecentWrite(_)
-\*MostRecentWrite(totalOrder) == IF totalOrder = << >> THEN NullReq
-\*                                ELSE    CASE Head(totalOrder).callType = WRITE_RESP -> Head(totalOrder)
-\*                                        [] Head(totalOrder).callType = READ_RESP -> MostRecentWrite(Tail(totalOrder))
-\*
-\*RECURSIVE ReadPrecededByWrite(_)                                
-\*ReadPrecededByWrite(totalOrder) == IF totalOrder = << >> THEN TRUE
-\*                                    ELSE LET reqOp == Head(totalOrder)
-\*                                             remainder == Tail(totalOrder) IN
-\*                                                CASE reqOp.callType = WRITE_RESP -> ReadPrecededByWrite(remainder)
-\*                                                [] reqOp.callType = READ_RESP -> LET pastWrite == MostRecentWrite(remainder) IN
-\*                                                                                    CASE pastWrite = NullReq -> FALSE
-\*                                                                                    [] reqOp.op.uniqueId = pastWrite.op.uniqueId -> 
-\*                                                                                        ReadPrecededByWrite(remainder)
-\*                                                                                    [] OTHER -> FALSE
 
-                                                                    
-\*RealtimeDependency(successor, predecessor) == predecessor.commitTs < successor.startTs
-\*IsConcurrent(reqOp1, reqOp2) == ~(  \/ RealtimeDependency(reqOp1, reqOp2)
-\*                                    \/ RealtimeDependency(reqOp1, reqOp2))
-\*                                                                    
-\*RECURSIVE IsConcurrentUntilLessThan(_, _)
-\*IsConcurrentUntilLessThan(op, remainder) == IF remainder = << >> THEN TRUE ELSE
-\*                                                    LET nextOp == Head(remainder) IN
-\*                                                    CASE RealtimeDependency(op, nextOp) -> TRUE
-\*                                                    [] IsConcurrent(op, nextOp) -> 
-\*                                                        IsConcurrentUntilLessThan(op, Tail(remainder))
-\*                                                    [] OTHER -> FALSE
-\*                                                 
-\*RECURSIVE RespectsRealtime(_)
-\*RespectsRealtime(totalOrder) == IF totalOrder = << >> 
-\*                                THEN TRUE
-\*                                ELSE IF IsConcurrentUntilLessThan(Head(totalOrder), Tail(totalOrder)) 
-\*                                        THEN RespectsRealtime(Tail(totalOrder))
-\*                                        ELSE FALSE
-
-
-
-
-\*IsLegal(totalOrder) ==  /\ ReadPrecededByWrite(totalOrder)
-\*\*                        /\ RespectsRealtime(totalOrder)
-\*
-\*LegalOrderInvariant == \A o \in Objects: IsLegal(objTotalOrders[o])
-\*
-\*
-\*RECURSIVE ContainsAllOps(_, _)                        
-\*ContainsAllOps(totalOrder, setOfOps) == CASE setOfOps = {} -> TRUE
-\*                                        [] totalOrder = << >> /\ setOfOps /= {} -> FALSE
-\*                                        [] \E reqOp \in setOfOps : reqOp = Head(totalOrder) -> 
-\*                                            ContainsAllOps(Tail(totalOrder), setOfOps \ {Head(totalOrder)})
-\*                                        [] OTHER -> ContainsAllOps(Tail(totalOrder), setOfOps)  \* newly committed op,
-\*                                                                                                \* not yet in total order
-\*                                            
-\*TotalOrderInvariant == \A o \in Objects: ContainsAllOps(objTotalOrders[o], allSubmittedWriteOps[o])
-\*                                            
-\*IsTotal(totalOrder, setOfOps) ==    /\ ContainsAllOps(totalOrder, setOfOps)
-\*                                    /\ Len(totalOrder) = Cardinality(setOfOps) 
-\*                                    
-\*
-\*IsObjLinearizable(totalOrder, setOfOps) ==  /\ IsLegal(totalOrder)
-\*                                            /\ IsTotal(totalOrder, setOfOps) 
-
-
-\*    fair process(perObj \in Objects)
-\*        variables   submittedOps = {},
-\*                    writes = {},
-\*                    reads = {},
-\*                    read = NullReq,
-\*                    edges = {},
-\*                    clients = Clients,
-\*                    match = NullReq,
-\*                    cli = NullClient;
-\*    {
-\*        \* runs at the end
-\*        awaitTermination: while (clients /= {}) {
-\*            cli := CHOOSE cl \in clients : TRUE;
-\*            clients := clients \ {cli};
-\*            await terminatedYet[cli] = TRUE;
-\*        };
-\*        
-\*        writes := allSubmittedWriteOps[self];
-\*        edges := {edge \in {<<w1, w2>> : w1, w2 \in writes}: edge[1].commitTs < edge[2].startTs};
-\*
-\*        reads := allSubmittedReadOps[self];
-\*        addVToG: while (reads /= {}) {
-\*            read := CHOOSE r \in reads: TRUE;
-\*            reads := reads \ {read};
-\*            
-\*            \* add_to_graph(read)
-\*            edges := edges \cup {<<write, read>>: write \in {w \in writes: w.commitTs < read.startTs}}; 
-\*            
-\*            \* find_matched_write(read)
-\*            match := CHOOSE w \in writes: w.uniqueId = read.op.uniqueId;
-\*            
-\*            \* merge_read_into_write(read, match)
-\*            merge_read_into_write: 
-\*            edges := edges \cup { <<write, match>>: write \in {w \in writes: w.commitTs < read.startTs}};
-\*            removeSelfEdges: 
-\*            edges := edges \ {e \in edges: e[1] = e[2]}; 
-\*            
-\*            \* check for cycles
-\*            if (\E e \in edges: <<e[2], e[1]>> \in edges) {
-\*                isLinearizable := FALSE
-\*            }
-\*            
-\*        }
-\*    }
     
 Writes(object) == allSubmittedWriteOps[object]
 E_G(object) == {edge \in {<<w1, w2>> : w1, w2 \in Writes(object)}: edge[1].commitTs < edge[2].startTs}
@@ -1401,24 +1186,19 @@ RECURSIVE ReduceSet(_, _, _)
 ReduceSet(set, f(_, _), e) == IF set = {} THEN e ELSE 
                             LET chosen == CHOOSE rand \in set: TRUE 
                             IN f(chosen, ReduceSet(set \ {chosen}, f, e))
-                            
-\*haonansAlgo(read, edges) == LET realtimeDep == edges \cup {<<write, read>>: write \in {w \in writes: w.commitTs < read.startTs})
-\*                                match == CHOOSE w \in writes: w.uniqueId = read.op.uniqueId
-\*                            IN  LET mergeReadIntoWrite == edges \cup { <<write, match>>: write \in {w \in writes: w.commitTs < read.startTs}}
-\*                                IN mergeReadIntoWrites \ {edge \in mergeReadIntoWrites: edges[1] = e[2]}
 
-Graph(object) == LET  writes == Writes(object)
-                    e_g == E_G(object)
-                    reads == Reads(object) 
-                    IN LET  haonansAlgo(read, edges) == 
-                            LET realtimeDep == edges \cup {<<write, read>>: write \in {w \in writes: w.commitTs < read.startTs}}
-                                match == CHOOSE w \in writes: w.uniqueId = read.op.uniqueId IN  
-                                LET mergeReadIntoWrite == edges \cup { <<write, match>>: write \in {w \in writes: w.commitTs < read.startTs}}
-                                IN mergeReadIntoWrite \ {edge \in mergeReadIntoWrite: edge[1] = edge[2]}
-                       IN   ReduceSet(reads, haonansAlgo, e_g)
+Graph(object) == LET    writes == Writes(object)
+                        e_g == E_G(object)
+                        reads == Reads(object) 
+                 IN LET haonansAlgo(read, edges) == 
+                        LET realtimeDep == edges \cup {<<write, read>>: write \in {w \in writes: w.commitTs < read.startTs}}
+                            match == CHOOSE w \in writes: w.uniqueId = read.op.uniqueId 
+                        IN  LET mergeReadIntoWrite == edges \cup { <<write, match>>: write \in {w \in writes: w.commitTs < read.startTs}}
+                            IN  mergeReadIntoWrite \ {edge \in mergeReadIntoWrite: edge[1] = edge[2]}
+                    IN  ReduceSet(reads, haonansAlgo, e_g)
 
                        
-IsLinearizable == \A object \in Objects: LET edges == Graph(object)
+IsLinearizable == \A object \in Objects:    LET edges == Graph(object)
                                             IN \E e \in edges: (<<e[2], e[1]>> \in edges) = FALSE
 
                                 
@@ -1428,6 +1208,6 @@ Linearizability == IsLinearizable
 
 =============================================================================
 \* Modification History
-\* Last modified Sat Jun 24 22:47:22 EDT 2023 by 72jen
+\* Last modified Sat Jun 24 23:07:18 EDT 2023 by 72jen
 \* Last modified Fri Jun 23 20:02:52 EDT 2023 by jenniferlam
 \* Created Tue Jun 13 12:56:59 EDT 2023 by jenniferlam
