@@ -131,7 +131,7 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         IsCrashed(node) == FALSE
         
         RECURSIVE AcceptBackpropLog(_, _)
-        AcceptBackpropLog(thatLog, thisLog) ==  IF thisLog = << >> \* if the log is empty
+        AcceptBackpropLog(thatLog, thisLog) ==  IF thisLog = << >> \* if this log is empty
                                                 THEN << >> \* then nothing could have been backpropped, nothing changes
                                                 ELSE LET thisMostRecentVer == Head(thisLog) IN
                                                         IF thisMostRecentVer.commitStatus = CLEAN \* if this log is clean
@@ -146,7 +146,12 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                                                                     \* and keep comparing matches between the rest of that log and this log
                                                                     ELSE Cons(thatMostRecentVer, AcceptBackpropLog(Tail(thatLog), Tail(thisLog)))
                                                                 \* if that log has an earlier version, keep backtracking through this log
-                                                                ELSE Cons(thisMostRecentVer, AcceptBackpropLog(thatLog, Tail(thisLog))        
+                                                                ELSE Cons(thisMostRecentVer, AcceptBackpropLog(thatLog, Tail(thisLog))
+        
+        RECURSIVE AcceptFwdpropLog(_, _)
+        AcceptFwdpropLog(thatLog, thisLog) == IF thatLog = << >> \* if propagated log is empty
+                                              THEN << >> \* then nothing propagated, return empty log
+                                              ELSE  
     }
     
     \* macro definitions
@@ -469,10 +474,14 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                             \* switches roles
                             goto rolenode;
                         }
-                    } 
-                }
-            }
-        }
+                    } else {
+                        if (req_t.callType = FWDPROP_LOG) {
+                            
+                        }
+                    } \* FWDPROP_LOG
+                } \* NODE_DEL
+            } \* WRITE_INV
+        } \* listen_t while (TRUE)
         
         rolenode: while (TRUE) {
             with (temp \in {s \in SendersTo(self) : msgQs[<<s, self>>] /= << >>}) {
@@ -1602,6 +1611,6 @@ Linearizability == IsLinearizable
 
 =============================================================================
 \* Modification History
-\* Last modified Sat Jul 29 00:24:30 EDT 2023 by 72jen
+\* Last modified Sat Jul 29 00:55:21 EDT 2023 by 72jen
 \* Last modified Fri Jun 23 20:02:52 EDT 2023 by jenniferlam
 \* Created Tue Jun 13 12:56:59 EDT 2023 by jenniferlam
