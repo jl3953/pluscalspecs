@@ -54,7 +54,7 @@ WRITE_INV == "WRITE_INV" \* Write invocation
 READ_RESP == "READ_RESP" \* Read response
 WRITE_RESP == "WRITE_RESP" \* Write response
 
-CRASHED == "CRASHED"
+ZK_SESSION_ENDED == "SESSION_ENDED"
 NOTCRASHED == "NOTCRASHED"
 
 NODE_DEL == "NODE_DEL"
@@ -128,8 +128,8 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         Find(set, k) == LET kv == FindPair(set, k) IN kv[2]
         
         Increment(id) == <<id[1], id[2]+1>>
-\*        IsCrashed(node) ==  LET crashed == CHOOSE c \in {CRASHED, NOTCRASHED}: TRUE 
-\*                                IN crashed = CRASHED
+\*        IsCrashed(node) ==  LET crashed == CHOOSE c \in {ZK_SESSION_ENDED, NOTCRASHED}: TRUE 
+\*                                IN crashed = ZK_SESSION_ENDED
         IsCrashed(node) == FALSE
         
         RECURSIVE AcceptBackpropLog(_, _)
@@ -336,7 +336,7 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
             when msgQs[<<crashedNode, Zookeeper>>] /= << >>;
             recv(crashedNode, Zookeeper, req_z); 
             
-            if (req_z.callType = CRASHED) {
+            if (req_z.callType = ZK_SESSION_ENDED) {
                 triggerWatches:
                 while (liveNodes /= {crashedNode}) {
                     liveNode := CHOOSE ln \in liveNodes: ln /= crashedNode;
@@ -607,12 +607,12 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
             }  
         };
         
-        crash: send(self, Zookeeper, [ callType |-> CRASHED ]);
+        crash: send(self, Zookeeper, [ callType |-> ZK_SESSION_ENDED ]);
     }
 }
 
 ****************************************************************************)
-\* BEGIN TRANSLATION (chksum(pcal) = "1c319ef8" /\ chksum(tla) = "76b5d529")
+\* BEGIN TRANSLATION (chksum(pcal) = "ace05506" /\ chksum(tla) = "106261ad")
 \* Label apportionQ of process ta at line 160 col 9 changed to apportionQ_
 \* Label respFromSelf of process ta at line 503 col 35 changed to respFromSelf_
 \* Label fwdFromTail of process ta at line 160 col 9 changed to fwdFromTail_
@@ -1058,7 +1058,7 @@ listen_z == /\ pc["zookeeper"] = "listen_z"
             /\ msgQs[<<crashedNode', Zookeeper>>] /= << >>
             /\ req_z' = Head(msgQs[<<crashedNode', Zookeeper>>])
             /\ msgQs' = [msgQs EXCEPT ![<<crashedNode', Zookeeper>>] = Tail(@)]
-            /\ IF req_z'.callType = CRASHED
+            /\ IF req_z'.callType = ZK_SESSION_ENDED
                   THEN /\ pc' = [pc EXCEPT !["zookeeper"] = "triggerWatches"]
                   ELSE /\ pc' = [pc EXCEPT !["zookeeper"] = "listen_z"]
             /\ UNCHANGED << objLogs, allSubmittedWriteOps, allSubmittedReadOps, 
@@ -1738,7 +1738,7 @@ crashLabelWriteResp(self) == /\ pc[self] = "crashLabelWriteResp"
                                              pendingInvos >>
 
 crash(self) == /\ pc[self] = "crash"
-               /\ msgQs' = [msgQs EXCEPT ![<<self, Zookeeper>>] = Append(@, ([ callType |-> CRASHED ]))]
+               /\ msgQs' = [msgQs EXCEPT ![<<self, Zookeeper>>] = Append(@, ([ callType |-> ZK_SESSION_ENDED ]))]
                /\ pc' = [pc EXCEPT ![self] = "Done"]
                /\ UNCHANGED << objLogs, allSubmittedWriteOps, 
                                allSubmittedReadOps, terminatedYet, 
@@ -1854,6 +1854,6 @@ Linearizability == IsLinearizable
 
 =============================================================================
 \* Modification History
-\* Last modified Sat Jul 29 20:53:58 EDT 2023 by 72jen
+\* Last modified Sat Jul 29 20:58:19 EDT 2023 by 72jen
 \* Last modified Fri Jun 23 20:02:52 EDT 2023 by jenniferlam
 \* Created Tue Jun 13 12:56:59 EDT 2023 by jenniferlam
