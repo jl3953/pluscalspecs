@@ -58,6 +58,8 @@ ZK_SESSION_ENDED == "SESSION_ENDED"
 NOTCRASHED == "NOTCRASHED"
 
 ZK_NODE_DEL == "ZK_NODE_DEL"
+FAILOVER_PROPAGATE_LOG == "FAILOVER_PROPAGATE_LOG"
+
 
 HEAD == "HEAD"
 MID == "MID"
@@ -102,6 +104,7 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
 
     \* declaration of global algorithms
     variables   msgQs = [edge \in Network |-> << >>], \* in-order delivery via TCP
+                failoverMsgQs = [edge \in Network |-> << >>],
                 objLogs = [n \in Nodes |-> [o \in Objects |-> << >>]],
                 allSubmittedWriteOps = [o \in Objects |-> {}],
                 allSubmittedReadOps = [ o \in Objects |-> {}],
@@ -136,9 +139,9 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
 \*                                IN crashed = ZK_SESSION_ENDED
         IsCrashed(node) == FALSE
         
-        HasOutstandingWrites == \A n \in Nodes: \A o \in Objects:   LET log == objLogs[n][o]
-                                                                    IN  LET mostRecentVer == Head(log)
-                                                                        IN mostRecentVer.commitStatus = CLEAN
+        HasOutstandingWrites(node) == \A o \in Objects: LET log == objLogs[node][o]
+                                                        IN  LET mostRecentVer == Head(log)
+                                                            IN mostRecentVer.commitStatus = DIRTY
         RECURSIVE AcceptBackpropLog(_, _)
         AcceptBackpropLog(thatLog, thisLog) ==  IF thisLog = << >> \* if this log is empty
                                                 THEN << >> \* then nothing could have been backpropped, nothing changes
@@ -167,9 +170,18 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         msgQs[<<sender, receiver>>] := Append(@, msg)
     }
     
+    macro failoverSend(sender, receiver, msg) {
+        failoverMsgQs[<<sender, receiver>>] := Append(@, msg)
+    }
+    
     macro recv(sender, receiver, msg) {
         msg := Head(msgQs[<<sender, receiver>>]);
         msgQs[<<sender, receiver>>] := Tail(@);
+    }
+    
+    macro failoverRecv(sender, receiver, msg) {
+        msg := Head(msgQs[<<sender, receiver>>]);
+        failoverMsgQs[<<sender, receiver>>] := Tail(@);
     }
     
     macro add(set, k, v) {
@@ -397,7 +409,10 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                                 } else {
                                     if (req.callType = ZK_NODE_DEL) {
                                         if (Sucessors[self] = req.crashedNode) {
-                                            goto handleCrashedNodePredecessor;
+                                            goto failoverCrashedNodePredecessor;
+                                        } else {
+                                            if (Predecessors[self] = req.crashedNode) {
+                                            }
                                         }
                                     }
                                 }
@@ -441,6 +456,14 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                 }
             }
         };
+        
+        failoverListen:
+        while (TRUE) {
+            with (temp \in {s \in SendersTo(self): failoverMsgQs[<<s, self>>] /= << >>}) {
+                sender := temp;
+            };
+        }
+        
         
         handleReadInv:
         if (IsDirty(self, req.op.obj)) {
@@ -523,10 +546,15 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         finishWriteResp:
         goto listen;
         
-        handleCrashedNodePredecessor:
-        if (hasOutstandingWrites(self
+        failoverCrashedNodePredecessor:
+        if (hasOutstandingWrites(self)) {
+            send(self, Successors[Successors[self]], [req.callType |-> FAILOVER_PROPAGATE_LOG])
+        }
         finishCrashedNodePredecessor:
         goto listen;
+        
+        handleCrashedNodeSuccessor:
+        
         
         crash:
         now := -1; \* that's it, we crashed
@@ -1470,6 +1498,6 @@ Linearizability == IsLinearizable
 
 =============================================================================
 \* Modification History
-\* Last modified Thu Sep 07 18:08:27 EDT 2023 by jenniferlam
+\* Last modified Fri Sep 08 18:14:59 EDT 2023 by jenniferlam
 \* Last modified Sat Jul 29 20:58:19 EDT 2023 by 72jen
 \* Created Tue Jun 13 12:56:59 EDT 2023 by jenniferlam
