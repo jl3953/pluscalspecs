@@ -57,7 +57,7 @@ WRITE_RESP == "WRITE_RESP" \* Write response
 ZK_SESSION_ENDED == "SESSION_ENDED"
 NOTCRASHED == "NOTCRASHED"
 
-NODE_DEL == "NODE_DEL"
+ZK_NODE_DEL == "ZK_NODE_DEL"
 
 HEAD == "HEAD"
 MID == "MID"
@@ -136,6 +136,9 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
 \*                                IN crashed = ZK_SESSION_ENDED
         IsCrashed(node) == FALSE
         
+        HasOutstandingWrites == \A n \in Nodes: \A o \in Objects:   LET log == objLogs[n][o]
+                                                                    IN  LET mostRecentVer == Head(log)
+                                                                        IN mostRecentVer.commitStatus = CLEAN
         RECURSIVE AcceptBackpropLog(_, _)
         AcceptBackpropLog(thatLog, thisLog) ==  IF thisLog = << >> \* if this log is empty
                                                 THEN << >> \* then nothing could have been backpropped, nothing changes
@@ -344,7 +347,7 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                 triggerWatches:
                 while (liveNodes /= {crashedNode}) {
                     liveNode := CHOOSE ln \in liveNodes: ln /= crashedNode;
-                    send(Zookeeper, liveNode, [ callType    |-> NODE_DEL,
+                    send(Zookeeper, liveNode, [ callType    |-> ZK_NODE_DEL,
                                                 crashedNode  |-> crashedNode]);
                     liveNodes := liveNodes \ {liveNode}
                 }
@@ -388,6 +391,16 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                         } else {
                             if (req.callType = WRITE_RESP) {
                                 goto handleWriteResp;
+                            } else {
+                                if (req.callType = CRASH) {
+                                    goto crash;
+                                } else {
+                                    if (req.callType = ZK_NODE_DEL) {
+                                        if (Sucessors[self] = req.crashedNode) {
+                                            goto handleCrashedNodePredecessor;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -399,6 +412,10 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                     } else {
                         if (req.callType = WRITE_INV) {
                             goto handleWriteInvTail;
+                        } else {
+                            if (req.callType = CRASH) {
+                                goto crash;
+                            } 
                         }
                     }
                 } else {
@@ -413,6 +430,10 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                             } else {
                                 if (req.callType = WRITE_RESP) {
                                     goto handleWriteResp;
+                                } else {
+                                    if (req.callType = CRASH){
+                                        goto crash;
+                                    }
                                 }
                             }
                         }
@@ -501,6 +522,14 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         
         finishWriteResp:
         goto listen;
+        
+        handleCrashedNodePredecessor:
+        if (hasOutstandingWrites(self
+        finishCrashedNodePredecessor:
+        goto listen;
+        
+        crash:
+        now := -1; \* that's it, we crashed
     }
     
 }
@@ -936,7 +965,7 @@ listen_z == /\ pc["zookeeper"] = "listen_z"
 triggerWatches == /\ pc["zookeeper"] = "triggerWatches"
                   /\ IF liveNodes /= {crashedNode}
                         THEN /\ liveNode' = (CHOOSE ln \in liveNodes: ln /= crashedNode)
-                             /\ msgQs' = [msgQs EXCEPT ![<<Zookeeper, liveNode'>>] = Append(@, ([ callType    |-> NODE_DEL,
+                             /\ msgQs' = [msgQs EXCEPT ![<<Zookeeper, liveNode'>>] = Append(@, ([ callType    |-> ZK_NODE_DEL,
                                                                                                   crashedNode  |-> crashedNode]))]
                              /\ liveNodes' = liveNodes \ {liveNode'}
                              /\ pc' = [pc EXCEPT !["zookeeper"] = "triggerWatches"]
@@ -1441,6 +1470,6 @@ Linearizability == IsLinearizable
 
 =============================================================================
 \* Modification History
-\* Last modified Thu Sep 07 17:03:42 EDT 2023 by jenniferlam
+\* Last modified Thu Sep 07 18:08:27 EDT 2023 by jenniferlam
 \* Last modified Sat Jul 29 20:58:19 EDT 2023 by 72jen
 \* Created Tue Jun 13 12:56:59 EDT 2023 by jenniferlam
