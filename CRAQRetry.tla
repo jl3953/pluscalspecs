@@ -1,7 +1,7 @@
 ----------------------------- MODULE CRAQRetry -----------------------------
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
-CONSTANTS Clients, Nodes, head, tail, NumWrites, NumReads, Objects, MaxTimestamp, initClient, Zookeeper\*, newTail, crashedN 
+CONSTANTS Clients, Nodes, head, tail, NumWrites, NumReads, Objects, MaxTimestamp, initClient, Zookeeper, crasherClient\*, newTail, crashedN 
 
 NumMsgs == 10
 
@@ -21,15 +21,21 @@ PrevEdges == { <<e[2], e[1]>> : e \in NextEdges }
 
 Edges == { <<o, p>> \in {<<n, m>>: n \in Nodes, m \in Nodes}: o /= p}   
 
-EdgesFromClients == { <<c, n>> : c \in Clients, n \in Nodes}
-EdgesToClients == { <<n, c>> : c \in Clients, n \in Nodes }
-ClientEdges == EdgesFromClients \cup EdgesToClients
+EdgesFromClients == { <<c, n>> : c \in (Clients \cup {initClient}), n \in Nodes}
+EdgesToClients == { <<n, c>> : c \in (Clients \cup {initClient}), n \in Nodes }
+ClientEdges == EdgesFromClients \cup EdgesToClients 
 
-EdgesToZookeeper == { <<n, Zookeeper>> : n \in Nodes }
-EdgesFromZookeeper == { <<Zookeeper, n>> : n \in Nodes }
+EdgesToZookeeper == { <<n, Zookeeper>> : n \in (Nodes \cup Clients) }
+EdgesFromZookeeper == { <<Zookeeper, n>> : n \in (Nodes \cup Clients)}
 ZookeeperEdges == EdgesToZookeeper \cup EdgesFromZookeeper
 
-Network == Edges \cup ClientEdges \cup ZookeeperEdges
+EdgesToCrasherClient == { <<n, crasherClient>> : n \in Nodes }
+EdgesFromCrasherClient == { <<crasherClient, n>> : n \in Nodes }
+CrasherClientEdges == EdgesToCrasherClient \cup EdgesFromCrasherClient 
+
+SelfEdges == { <<n, n>> : n \in Nodes}
+
+Network == Edges \cup ClientEdges \cup ZookeeperEdges \cup CrasherClientEdges \cup SelfEdges
 
 UniqueIdType == {<<c, id>> : c \in Clients, id \in 0..NumMsgs}
 NullUniqueId == CHOOSE id : id \notin UniqueIdType
@@ -46,8 +52,6 @@ ASSUME  /\ head \in Nodes
 -----------------------------------------------------------------------------
 
 
-
-
 \* CallType
 READ_INV == "READ_INV" \* Read invocation
 WRITE_INV == "WRITE_INV" \* Write invocation
@@ -59,7 +63,12 @@ NOTCRASHED == "NOTCRASHED"
 CRASH == "CRASH"
 
 ZK_NODE_DEL == "ZK_NODE_DEL"
+ZK_NODE_ADD == "ZK_NODE_ADD"
+ZK_CREATE == "ZK_CREATE"
+
 FAILOVER_PROPAGATE_LOG == "FAILOVER_PROPAGATE_LOG"
+FAILOVER_NOTIFY_TAIL == "FAILOVER_NOTIFY_TAIL"
+TIMEOUT == "TIMEOUT"
 
 
 HEAD == "HEAD"
@@ -87,6 +96,7 @@ ObjectVersionType == [  obj: Objects,
                         writeStartTs: TimestampType \cup {NullTs}, 
                         writeCommitTs: TimestampType \cup {NullTs}, 
                         commitStatus: CommitType \cup {NullCommitStatus}]
+NullObjectVersion == {}
              
 RequestType == [callType: CallType, 
                 uniqueId: UniqueIdType \cup {NullUniqueId},
@@ -138,35 +148,56 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         Find(set, k) == LET kv == FindPair(set, k) IN kv[2]
         
         Increment(id) == <<id[1], id[2]+1>>
-\*        IsCrashed(node) ==  LET crashed == CHOOSE c \in {ZK_SESSION_ENDED, NOTCRASHED}: TRUE 
-\*                                IN crashed = ZK_SESSION_ENDED
-        IsCrashed(node) == FALSE
-        
-        HasOutstandingWrites(node) == \A o \in Objects: LET log == objLogs[node][o]
-                                                        IN  LET mostRecentVer == Head(log)
-                                                            IN mostRecentVer.commitStatus = DIRTY
-                                                            
-        RECURSIVE ActiveNodes(_)
-        ActiveNodes(node) ==    IF node = currentTail 
+                
+        RECURSIVE FindActiveNodes(_)
+        FindActiveNodes(node) ==    IF node = currentTail 
                                 THEN {node} 
-                                ELSE {node} \union ActiveNodes(Successors[node])
-                                 
-        RECURSIVE AcceptBackpropLog(_, _)
-        AcceptBackpropLog(thatLog, thisLog) ==  IF thisLog = << >> \* if this log is empty
-                                                THEN << >> \* then nothing could have been backpropped, nothing changes
-                                                ELSE    LET thisMostRecentVer == Head(thisLog)
-                                                        IN  IF thisMostRecentVer.commitStatus = CLEAN \* if this log is clean
-                                                            THEN thisLog \* then we have nothing to add
-                                                            ELSE    LET thatMostRecentVer == Head(thatLog) \* if this log has dirty writes
-                                                                    \* and the backpropped log has the same write
-                                                                    IN  IF  thisMostRecentVer.uniqueId = thatMostRecentVer.uniqueId
-                                                                        THEN    IF thatMostRecentVer.commitStatus = DIRTY \* and that log is also dirty
-                                                                                THEN thisLog  \* the two logs match, nothing more to change
-                                                                                \* if that log is clean though, commit the write in this log
-                                                                                \* and keep comparing matches between the rest of that log and this log
-                                                                                ELSE Cons(thatMostRecentVer, AcceptBackpropLog(Tail(thatLog), Tail(thisLog)))
-                                                                        \* if that log has an earlier version, keep backtracking through this log
-                                                                        ELSE Cons(thisMostRecentVer, AcceptBackpropLog(thatLog, Tail(thisLog)))
+                                ELSE {node} \cup FindActiveNodes(Successors[node])
+                                
+        ActiveNodes == FindActiveNodes(currentHead)
+        
+        RECURSIVE FindUnpropagatedWrites(_, _, _)
+        FindUnpropagatedWrites(thatObjLogs, thisObjLogs, remainingObjSet) == 
+            IF remainingObjSet = {} 
+            THEN {}
+            ELSE    LET obj == CHOOSE o \in remainingObjSet : TRUE
+                    IN  LET thatLog == thatObjLogs[obj]
+                            thisLog == thisObjLogs[obj]
+                        IN  IF  /\ Head(thatLog).commitStatus = DIRTY 
+                                /\ Head(thisLog).commitStatus = CLEAN
+                                /\ Head(thatLog).uniqueId /= Head(thisLog).uniqueId
+                            THEN {Head(thatLog)} \cup FindUnpropagatedWrites(thatObjLogs, thisObjLogs, remainingObjSet \ {obj})
+                            ELSE FindUnpropagatedWrites(thatObjLogs, thisObjLogs, remainingObjSet \ {obj})
+                            
+        RECURSIVE FindAckdWrites(_, _, _)
+        FindAckdWrites(thatObjLogs, thisObjLogs, remainingObjSet) ==
+            IF remainingObjSet = {}
+            THEN {}
+            ELSE    LET obj == CHOOSE o \in remainingObjSet : TRUE
+                    IN LET  thatLog == thatObjLogs[obj]
+                            thisLog == thisObjLogs[obj]
+                       IN   IF  /\ Head(thatLog).uniqueId = Head(thisLog).uniqueId
+                                /\ Head(thatLog).commitStatus = DIRTY
+                                /\ Head(thisLog).commitStatus = CLEAN
+                            THEN {Head(thisLog)} \cup FindAckdWrites(thatObjLogs, thisObjLogs, remainingObjSet \ {obj})
+                            ELSE FindAckdWrites(thatObjLogs, thisObjLogs, remainingObjSet \ {obj})
+                                                                             
+\*        RECURSIVE AcceptBackpropLog(_, _)
+\*        AcceptBackpropLog(thatLog, thisLog) ==  IF thisLog = << >> \* if this log is empty
+\*                                                THEN << >> \* then nothing could have been backpropped, nothing changes
+\*                                                ELSE    LET thisMostRecentVer == Head(thisLog)
+\*                                                        IN  IF thisMostRecentVer.commitStatus = CLEAN \* if this log is clean
+\*                                                            THEN thisLog \* then we have nothing to add
+\*                                                            ELSE    LET thatMostRecentVer == Head(thatLog) \* if this log has dirty writes
+\*                                                                    \* and the backpropped log has the same write
+\*                                                                    IN  IF  thisMostRecentVer.uniqueId = thatMostRecentVer.uniqueId
+\*                                                                        THEN    IF thatMostRecentVer.commitStatus = DIRTY \* and that log is also dirty
+\*                                                                                THEN thisLog  \* the two logs match, nothing more to change
+\*                                                                                \* if that log is clean though, commit the write in this log
+\*                                                                                \* and keep comparing matches between the rest of that log and this log
+\*                                                                                ELSE Cons(thatMostRecentVer, AcceptBackpropLog(Tail(thatLog), Tail(thisLog)))
+\*                                                                        \* if that log has an earlier version, keep backtracking through this log
+\*                                                                        ELSE Cons(thisMostRecentVer, AcceptBackpropLog(thatLog, Tail(thisLog)))
         
 \*        RECURSIVE AcceptFwdpropLog(_, _)
 \*        AcceptFwdpropLog(thatLog, thisLog) == IF thatLog = << >> \* if propagated log is empty
@@ -189,7 +220,7 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
     }
     
     macro failoverRecv(sender, receiver, msg) {
-        msg := Head(msgQs[<<sender, receiver>>]);
+        msg := Head(failoverMsgQs[<<sender, receiver>>]);
         failoverMsgQs[<<sender, receiver>>] := Tail(@);
     }
     
@@ -297,8 +328,12 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
     fair process(crasher="crasher")
         variables crashNode = NullNode; 
     {
+        waitForInit_crasher:
+        when start = TRUE;
+\*        when FALSE;
+        initCrash:
         crashNode := CHOOSE n \in ActiveNodes: n /= currentHead /\ n /= currentTail;
-        send(crasher, crashNode, [callType |-> CRASH]);
+        send(crasherClient, crashNode, [callType |-> CRASH]);
     }
     
     fair process(c \in nonInitClients)
@@ -309,8 +344,8 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                     gateway_c = NullNode,
                     msg_c = NullReq,
                     uniqueId = <<self, 1>>,
-                    sentOps = 0,
-                    recvdOps = 0;
+                    outstandingOps = 0
+                    ;
     {   
         waitForInit: when start = TRUE;
         concurrentOps: 
@@ -318,40 +353,47 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
             obj := CHOOSE o \in objs: TRUE;
             objs := objs \ {obj};
             
+            actions := {WRITE_INV, READ_INV};
             readOrWrite: 
             while (actions /= {}) {
                 action := CHOOSE a \in actions: TRUE;
                 actions := actions \ {action};
                 
-                send(   self, 
-                        IF action = WRITE_INV THEN head ELSE CHOOSE n \in Nodes: n /= head, 
-                        [   callType |-> action,
-                            uniqueId |-> uniqueId,
-                            startTs |-> NullTs,
-                            commitTs |-> NullTs,
-                            op |-> [obj |-> obj,
-                                    uniqueId |-> uniqueId,
-                                    writeStartTs |-> NullTs,
-                                    writeCommitTs |-> NullTs,
-                                    commitStatus |-> IF action = WRITE_INV 
-                                                        THEN DIRTY 
-                                                        ELSE NullCommitStatus]]);
-                uniqueId := Increment(uniqueId);
-                sentOps := sentOps + 1;
-                
-                waitForOps:
-                while (recvdOps < sentOps) {
-                    with (temp \in {s \in SendersTo(self): msgQs[<<s, self>>] /= << >>}) {
-                        gateway_c := temp;
+                sendToActiveNode:
+                while ( \/ msg_c = NullReq
+                        \/ msg_c.callType = TIMEOUT) {
+                    send(   self, 
+                            IF action = WRITE_INV THEN head ELSE CHOOSE n \in ActiveNodes: n /= head, 
+                            [   callType |-> action,
+                                uniqueId |-> uniqueId,
+                                startTs |-> NullTs,
+                                commitTs |-> NullTs,
+                                op |-> [obj |-> obj,
+                                        uniqueId |-> uniqueId,
+                                        writeStartTs |-> NullTs,
+                                        writeCommitTs |-> NullTs,
+                                        commitStatus |->    IF action = WRITE_INV 
+                                                            THEN DIRTY 
+                                                            ELSE NullCommitStatus]]);
+                    outstandingOps := outstandingOps + 1;
+                    
+                    waitForOps:
+                    while (outstandingOps > 0) {
+                        with (temp \in {s \in SendersTo(self): msgQs[<<s, self>>] /= << >>}) {
+                            gateway_c := temp;
+                            outstandingOps := outstandingOps - 1;
+                        };
                     };
                     when msgQs[<<gateway_c, self>>] /= << >>; 
                     recv(gateway_c, self, msg_c); 
-                    addToOpSet(msg_c);
-                    assert(msg_c.uniqueId[1] = self);
-                    recvdOps := recvdOps + 1;
                 };
+                
+                uniqueId := Increment(uniqueId);
+                addToOpSet(msg_c);
+                assert(msg_c.uniqueId[1] = self);
+                msg_c := NullReq;
             };
-            actions := {WRITE_INV, READ_INV}; 
+             
         };
         
         terminate: terminatedYet[self] := TRUE;
@@ -359,27 +401,51 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
     
     fair process(zk="zookeeper")
         variables   crashedNode = NullNode,
+                    sender_zk = NullNode,
                     liveNode = NullNode,
                     req_z = NullReq,
-                    liveNodes = Nodes; 
+                    liveNodes = {}; 
     {
         listen_z: while (TRUE) {
             with (temp \in {s \in SendersTo(Zookeeper): msgQs[<<s, Zookeeper>>] /= << >>}) {
-                crashedNode := temp;
+                sender_zk := temp;
             };
             
-            when msgQs[<<crashedNode, Zookeeper>>] /= << >>;
-            recv(crashedNode, Zookeeper, req_z); 
+            when msgQs[<<sender_zk, Zookeeper>>] /= << >>;
+            recv(sender_zk, Zookeeper, req_z); 
             
             if (req_z.callType = ZK_SESSION_ENDED) {
-                triggerWatches:
-                while (liveNodes /= {crashedNode}) {
-                    liveNode := CHOOSE ln \in liveNodes: ln /= crashedNode;
+                crashedNode := sender_zk;
+                liveNodes := Nodes \ {crashedNode};
+                triggerWatchesNodeDel:
+                while (liveNodes /= {}) {
+                    liveNode := CHOOSE ln \in liveNodes: TRUE;
                     send(Zookeeper, liveNode, [ callType    |-> ZK_NODE_DEL,
                                                 crashedNode  |-> crashedNode]);
-                    liveNodes := liveNodes \ {liveNode}
+                    liveNodes := liveNodes \ {liveNode};
+                }                        
+            } else {
+                if (req_z.callType = ZK_CREATE) {
+                    liveNodes := Nodes;
+                    triggerWatchesNodeAdd:
+                    while (liveNodes /= {}) {
+                        liveNode := CHOOSE ln \in liveNodes : TRUE;
+                        failoverSend(Zookeeper, liveNode, [ callType |-> ZK_NODE_ADD]);
+                        liveNodes := liveNodes \ {liveNode};
+                    };
+                    
+                    liveNodes := Clients;
+                    
+                    timeoutClients:
+                    while (liveNodes /= {}) {
+                        liveNode := CHOOSE client \in liveNodes : TRUE;
+                        liveNodes := liveNodes \ {liveNode};
+                        
+                        if (msgQs[<<liveNode, crashedNode>>] /= << >>) {
+                            send(Zookeeper, liveNode, [callType |-> TIMEOUT]);
+                        };
+                    };
                 }
-                                        
             }
         }
     }
@@ -389,7 +455,13 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                     sender = NullNode,
                     req = NullReq,
                     pendingInvos = {},
-                    now = timeOracle;
+                    failoverPendingInvos = {},
+                    now = timeOracle,
+                    failoverUnpropagatedWrites = {},
+                    failoverAckdWrites = {},
+                    version = NullObjectVersion,
+                    pendingInvo = <<NullUniqueId, NullNode>>
+                    ;
                     
     {
         roleAssignment:
@@ -422,11 +494,14 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                                     goto crash;
                                 } else {
                                     if (req.callType = ZK_NODE_DEL) {
-                                        if (Successors[self] = req.crashedNode) {
-                                            goto failoverCrashedNodePredecessor;
-\*                                        } else {
-\*                                            if (Predecessors[self] = req.crashedNode) {
-\*                                            }
+                                        if (req.crashedNode = Successors[self]) {
+                                            goto failoverCrashedNodeIsSuccessor;
+                                        } else {
+                                            if (req.crashedNode = Predecessors[self]) {
+                                                goto failoverCrashedNodeIsPredecessor; 
+                                            } else {
+                                                goto failoverListen;
+                                            }
                                         }
                                     }
                                 }
@@ -444,6 +519,14 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                         } else {
                             if (req.callType = CRASH) {
                                 goto crash;
+                            } else {
+                                if (req.callType = ZK_NODE_DEL) {
+                                    if (Predecessors[self] = req.crashedNode) {
+                                        goto failoverCrashedNodeIsPredecessor;
+                                    } else {
+                                        goto failoverListen;
+                                    }
+                                }
                             } 
                         }
                     }
@@ -462,6 +545,18 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
                                 } else {
                                     if (req.callType = CRASH){
                                         goto crash;
+                                    } else {
+                                        if (req.callType = ZK_NODE_DEL) {
+                                            if (req.crashedNode = Successors[self]) {
+                                                goto failoverCrashedNodeIsSuccessor;
+                                            } else {
+                                                if (req.crashedNode = Predecessors[self]) {
+                                                    goto failoverCrashedNodeIsPredecessor; 
+                                                } else {
+                                                    goto failoverListen;
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -476,9 +571,29 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
             with (temp \in {s \in SendersTo(self): failoverMsgQs[<<s, self>>] /= << >>}) {
                 sender := temp;
             };
+            
+            when failoverMsgQs[<<sender, self>>] /= << >>;  
+            failoverRecv(sender, self, req);
+            
+            if (req.callType = FAILOVER_NOTIFY_TAIL) {
+                if (role = TAIL) {
+                    goto failoverTailPropsLog;
+                }
+            } else {
+                if (req.callType = FAILOVER_PROPAGATE_LOG) {
+                    goto failoverAssumeNewTail;
+                } else {
+                    if (req.callType = ZK_NODE_ADD) {
+                        goto listen;
+                    }
+                }
+            }
+            
         };
         
-        
+        \********
+        \* handle read invocation requests
+        \********
         handleReadInv:
         if (IsDirty(self, req.op.obj)) {
             apportionQ: send(self, currentTail, req);
@@ -497,6 +612,9 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         finishReadInv:
         goto listen;
         
+        \********
+        \* handle read invocations at the tail
+        \********
         handleReadInvTail:
         now := timeOracle;
         timeOracle := timeOracle + 1;
@@ -510,12 +628,18 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         finishReadInvTail:
         goto listen;
         
+        \********
+        \* handle read responses
+        \********
         handleReadResp:
         send(self, Find(pendingInvos, req.uniqueId), req);
         remove(pendingInvos, req.uniqueId);
         finishReadResp:
         goto listen;
         
+        \********
+        \* handle write invocations at the head
+        \********
         handleWriteInvHead:
         now := timeOracle;
         timeOracle := timeOracle + 1;
@@ -529,6 +653,9 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         finishWriteInvHead:
         goto listen;
         
+        \********
+        \* handle write invocations
+        \********
         handleWriteInv:
         write(self, req.op);
         send(self, Successors[self], req);
@@ -537,6 +664,9 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         finishWriteInv:
         goto listen;
         
+        \********
+        \* handle write invocations at the tail
+        \********
         handleWriteInvTail:
         now := timeOracle;
         timeOracle := timeOracle + 1;
@@ -552,6 +682,9 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         finishWriteInvTail:
         goto listen;
         
+        \********
+        \* handle write response
+        \********
         handleWriteResp:
         objLogs[self][req.op.obj] := CommitDirtyVersion(@, req.op);
         send(self, Find(pendingInvos, req.uniqueId), req);
@@ -560,24 +693,108 @@ PendingInvoType == { <<id, node>>: id \in UniqueIdType, node \in Nodes}
         finishWriteResp:
         goto listen;
         
-        failoverCrashedNodePredecessor:
-        if (HasOutstandingWrites(self)) {
-            send(self, Successors[Successors[self]], [callType |-> FAILOVER_PROPAGATE_LOG]);
+        \********
+        \* failover, if the crashed node is this node's successor
+        \********
+        failoverCrashedNodeIsSuccessor:
+        failoverSend(self, Successors[Successors[self]], [  callType |-> FAILOVER_PROPAGATE_LOG,
+                                                            log |-> objLogs[self]
+                                                          ]);
+        Successors[self] := Successors[Successors[self]];
+        finishCrashedNodeIsSuccessor:
+        goto failoverListen;
+        
+        \********
+        \* failover, if crashed node is this node's predecessor
+        \********
+        failoverCrashedNodeIsPredecessor:
+        \* wait for propagate message
+        with (temp \in {s \in SendersTo(self): failoverMsgQs[<<s, self>>] /= << >>}) {
+            sender := temp;
         };
-        finishCrashedNodePredecessor:
-        goto listen;
+        when failoverMsgQs[<<sender, self>>] /= << >>;  
+        failoverRecv(sender, self, req);
+        assert(req.callType = FAILOVER_PROPAGATE_LOG);
         
-\*        handleCrashedNodeSuccessor:
+        
+        failoverUnpropagatedWrites := FindUnpropagatedWrites(req.log, objLogs[self], Objects);
+        propagateFailedWrites:
+        while (failoverUnpropagatedWrites /= {}) {
+            version := CHOOSE v \in failoverUnpropagatedWrites : TRUE;
+            write(self, version);
+            send(self, Successors[self], [  callType |-> WRITE_INV,
+                                            uniqueId |-> version.uniqueId,
+                                            startTs |-> version.writeStartTs,
+                                            commitTs |-> NullTs,
+                                            op |-> version]);
+            add(pendingInvos, version.uniqueId, sender);
+            failoverUnpropagatedWrites := failoverUnpropagatedWrites \ {version};
+        };
+        failoverAckdWrites := FindAckdWrites(req.log, objLogs[self], Objects);
+        
+        backpropFailedAcks:
+        while (failoverAckdWrites /= {}) {
+            version := CHOOSE v \in failoverAckdWrites : TRUE;
+            send(self, Predecessors[Predecessors[self]], [  callType |-> WRITE_RESP,
+                                                            uniqueId |-> version.uniqueId,
+                                                            startTs |-> version.writeStartTs,
+                                                            commitTs |-> version.writeCommitTs,
+                                                            op |-> version]);
+        };
+        
+        notifyTail:
+        failoverSend(self, currentTail, [callType |-> FAILOVER_NOTIFY_TAIL]);
+        
+        Predecessors[self] := Predecessors[Predecessors[self]];
+        
+        finishCrashedNodeIsPredecessor:
+        goto failoverListen;
+        
+        \********
+        \* failover, tail propagates log to new tail
+        \********
+        failoverTailPropsLog:
+        failoverSend(self, Successors[self], [  callType |-> FAILOVER_PROPAGATE_LOG,
+                                                log |-> objLogs[self]
+                                              ]);
+        finishFailoverTailPropsLog:
+        goto failoverListen;
+        
+        \********
+        \* failover, assume new tail role
+        \********
+        failoverAssumeNewTail:
+        objLogs[self] := req.log;
+        currentTail := self;
+        
+        notifyZookeeper:
+        send(self, Zookeeper, [ callType |-> ZK_CREATE]);
+
+        finishFailoverAssumeNewTail:
+        goto failoverListen;
         
         
+        \********
+        \* crash a node
+        \********
         crash:
-        now := -1; \* that's it, we crashed
+        send(self, Zookeeper, [ callType |-> ZK_SESSION_ENDED]);
+        
+        zkConfigChanged:
+        with (temp \in {s \in SendersTo(self): failoverMsgQs[<<s, self>>] /= << >>}) {
+                sender:= temp;
+        };
+        when failoverMsgQs[<<sender, self>>] /= << >>;  
+        failoverRecv(sender, self, req);
+        assert(req.callType = ZK_NODE_ADD);
+        
+        
     }
     
 }
 
 ****************************************************************************)
-\* BEGIN TRANSLATION (chksum(pcal) = "15f136c3" /\ chksum(tla) = "9d79a935")
+\* BEGIN TRANSLATION (chksum(pcal) = "85bb0e45" /\ chksum(tla) = "dc975353")
 VARIABLES msgQs, failoverMsgQs, objLogs, allSubmittedWriteOps, 
           allSubmittedReadOps, terminatedYet, nonInitClients, start, 
           timeOracle, Successors, Predecessors, currentHead, currentTail, pc
@@ -600,51 +817,59 @@ Find(set, k) == LET kv == FindPair(set, k) IN kv[2]
 
 Increment(id) == <<id[1], id[2]+1>>
 
-
-IsCrashed(node) == FALSE
-
-HasOutstandingWrites(node) == \A o \in Objects: LET log == objLogs[node][o]
-                                                IN  LET mostRecentVer == Head(log)
-                                                    IN mostRecentVer.commitStatus = DIRTY
-
-RECURSIVE ActiveNodes(_)
-ActiveNodes(node) ==    IF node = currentTail
+RECURSIVE FindActiveNodes(_)
+FindActiveNodes(node) ==    IF node = currentTail
                         THEN {node}
-                        ELSE {node} \union ActiveNodes(Successors[node])
+                        ELSE {node} \cup FindActiveNodes(Successors[node])
 
-RECURSIVE AcceptBackpropLog(_, _)
-AcceptBackpropLog(thatLog, thisLog) ==  IF thisLog = << >>
-                                        THEN << >>
-                                        ELSE    LET thisMostRecentVer == Head(thisLog)
-                                                IN  IF thisMostRecentVer.commitStatus = CLEAN
-                                                    THEN thisLog
-                                                    ELSE    LET thatMostRecentVer == Head(thatLog)
+ActiveNodes == FindActiveNodes(currentHead)
 
-                                                            IN  IF  thisMostRecentVer.uniqueId = thatMostRecentVer.uniqueId
-                                                                THEN    IF thatMostRecentVer.commitStatus = DIRTY
-                                                                        THEN thisLog
+RECURSIVE FindUnpropagatedWrites(_, _, _)
+FindUnpropagatedWrites(thatObjLogs, thisObjLogs, remainingObjSet) ==
+    IF remainingObjSet = {}
+    THEN {}
+    ELSE    LET obj == CHOOSE o \in remainingObjSet : TRUE
+            IN  LET thatLog == thatObjLogs[obj]
+                    thisLog == thisObjLogs[obj]
+                IN  IF  /\ Head(thatLog).commitStatus = DIRTY
+                        /\ Head(thisLog).commitStatus = CLEAN
+                        /\ Head(thatLog).uniqueId /= Head(thisLog).uniqueId
+                    THEN {Head(thatLog)} \cup FindUnpropagatedWrites(thatObjLogs, thisObjLogs, remainingObjSet \ {obj})
+                    ELSE FindUnpropagatedWrites(thatObjLogs, thisObjLogs, remainingObjSet \ {obj})
 
-
-                                                                        ELSE Cons(thatMostRecentVer, AcceptBackpropLog(Tail(thatLog), Tail(thisLog)))
-
-                                                                ELSE Cons(thisMostRecentVer, AcceptBackpropLog(thatLog, Tail(thisLog)))
+RECURSIVE FindAckdWrites(_, _, _)
+FindAckdWrites(thatObjLogs, thisObjLogs, remainingObjSet) ==
+    IF remainingObjSet = {}
+    THEN {}
+    ELSE    LET obj == CHOOSE o \in remainingObjSet : TRUE
+            IN LET  thatLog == thatObjLogs[obj]
+                    thisLog == thisObjLogs[obj]
+               IN   IF  /\ Head(thatLog).uniqueId = Head(thisLog).uniqueId
+                        /\ Head(thatLog).commitStatus = DIRTY
+                        /\ Head(thisLog).commitStatus = CLEAN
+                    THEN {Head(thisLog)} \cup FindAckdWrites(thatObjLogs, thisObjLogs, remainingObjSet \ {obj})
+                    ELSE FindAckdWrites(thatObjLogs, thisObjLogs, remainingObjSet \ {obj})
 
 VARIABLES uninitializedObjs, initObj, objs_init, obj_init, actions_init, 
           action_init, gateway_cinit, msg_cinit, uniqueId_cinit, sentOps_init, 
-          recvdOps_init, objs, obj, actions, action, gateway_c, msg_c, 
-          uniqueId, sentOps, recvdOps, crashedNode, liveNode, req_z, 
-          liveNodes, role, sender, req, pendingInvos, now
+          recvdOps_init, crashNode, objs, obj, actions, action, gateway_c, 
+          msg_c, uniqueId, outstandingOps, crashedNode, sender_zk, liveNode, 
+          req_z, liveNodes, role, sender, req, pendingInvos, 
+          failoverPendingInvos, now, failoverUnpropagatedWrites, 
+          failoverAckdWrites, version, pendingInvo
 
 vars == << msgQs, failoverMsgQs, objLogs, allSubmittedWriteOps, 
            allSubmittedReadOps, terminatedYet, nonInitClients, start, 
            timeOracle, Successors, Predecessors, currentHead, currentTail, pc, 
            uninitializedObjs, initObj, objs_init, obj_init, actions_init, 
            action_init, gateway_cinit, msg_cinit, uniqueId_cinit, 
-           sentOps_init, recvdOps_init, objs, obj, actions, action, gateway_c, 
-           msg_c, uniqueId, sentOps, recvdOps, crashedNode, liveNode, req_z, 
-           liveNodes, role, sender, req, pendingInvos, now >>
+           sentOps_init, recvdOps_init, crashNode, objs, obj, actions, action, 
+           gateway_c, msg_c, uniqueId, outstandingOps, crashedNode, sender_zk, 
+           liveNode, req_z, liveNodes, role, sender, req, pendingInvos, 
+           failoverPendingInvos, now, failoverUnpropagatedWrites, 
+           failoverAckdWrites, version, pendingInvo >>
 
-ProcSet == {"initClient"} \cup (nonInitClients) \cup {"zookeeper"} \cup (Nodes)
+ProcSet == {"initClient"} \cup {"crasher"} \cup (nonInitClients) \cup {"zookeeper"} \cup (Nodes)
 
 Init == (* Global variables *)
         /\ msgQs = [edge \in Network |-> << >>]
@@ -672,6 +897,8 @@ Init == (* Global variables *)
         /\ uniqueId_cinit = <<initClient, 1>>
         /\ sentOps_init = 0
         /\ recvdOps_init = 0
+        (* Process crasher *)
+        /\ crashNode = NullNode
         (* Process c *)
         /\ objs = [self \in nonInitClients |-> Objects]
         /\ obj = [self \in nonInitClients |-> NullObj]
@@ -680,20 +907,26 @@ Init == (* Global variables *)
         /\ gateway_c = [self \in nonInitClients |-> NullNode]
         /\ msg_c = [self \in nonInitClients |-> NullReq]
         /\ uniqueId = [self \in nonInitClients |-> <<self, 1>>]
-        /\ sentOps = [self \in nonInitClients |-> 0]
-        /\ recvdOps = [self \in nonInitClients |-> 0]
+        /\ outstandingOps = [self \in nonInitClients |-> 0]
         (* Process zk *)
         /\ crashedNode = NullNode
+        /\ sender_zk = NullNode
         /\ liveNode = NullNode
         /\ req_z = NullReq
-        /\ liveNodes = Nodes
+        /\ liveNodes = {}
         (* Process n *)
         /\ role = [self \in Nodes |-> MID]
         /\ sender = [self \in Nodes |-> NullNode]
         /\ req = [self \in Nodes |-> NullReq]
         /\ pendingInvos = [self \in Nodes |-> {}]
+        /\ failoverPendingInvos = [self \in Nodes |-> {}]
         /\ now = [self \in Nodes |-> timeOracle]
+        /\ failoverUnpropagatedWrites = [self \in Nodes |-> {}]
+        /\ failoverAckdWrites = [self \in Nodes |-> {}]
+        /\ version = [self \in Nodes |-> NullObjectVersion]
+        /\ pendingInvo = [self \in Nodes |-> <<NullUniqueId, NullNode>>]
         /\ pc = [self \in ProcSet |-> CASE self = "initClient" -> "initializeObj"
+                                        [] self = "crasher" -> "waitForInit_crasher"
                                         [] self \in nonInitClients -> "waitForInit"
                                         [] self = "zookeeper" -> "listen_z"
                                         [] self \in Nodes -> "roleAssignment"]
@@ -724,11 +957,14 @@ initializeObj == /\ pc["initClient"] = "initializeObj"
                                  Predecessors, currentHead, currentTail, 
                                  objs_init, obj_init, actions_init, 
                                  action_init, gateway_cinit, msg_cinit, 
-                                 sentOps_init, recvdOps_init, objs, obj, 
-                                 actions, action, gateway_c, msg_c, uniqueId, 
-                                 sentOps, recvdOps, crashedNode, liveNode, 
-                                 req_z, liveNodes, role, sender, req, 
-                                 pendingInvos, now >>
+                                 sentOps_init, recvdOps_init, crashNode, objs, 
+                                 obj, actions, action, gateway_c, msg_c, 
+                                 uniqueId, outstandingOps, crashedNode, 
+                                 sender_zk, liveNode, req_z, liveNodes, role, 
+                                 sender, req, pendingInvos, 
+                                 failoverPendingInvos, now, 
+                                 failoverUnpropagatedWrites, 
+                                 failoverAckdWrites, version, pendingInvo >>
 
 waitFor_init == /\ pc["initClient"] = "waitFor_init"
                 /\ msgQs[<<head, initClient>>] /= << >>
@@ -746,10 +982,13 @@ waitFor_init == /\ pc["initClient"] = "waitFor_init"
                                 uninitializedObjs, initObj, objs_init, 
                                 obj_init, actions_init, action_init, 
                                 gateway_cinit, uniqueId_cinit, sentOps_init, 
-                                recvdOps_init, objs, obj, actions, action, 
-                                gateway_c, msg_c, uniqueId, sentOps, recvdOps, 
-                                crashedNode, liveNode, req_z, liveNodes, role, 
-                                sender, req, pendingInvos, now >>
+                                recvdOps_init, crashNode, objs, obj, actions, 
+                                action, gateway_c, msg_c, uniqueId, 
+                                outstandingOps, crashedNode, sender_zk, 
+                                liveNode, req_z, liveNodes, role, sender, req, 
+                                pendingInvos, failoverPendingInvos, now, 
+                                failoverUnpropagatedWrites, failoverAckdWrites, 
+                                version, pendingInvo >>
 
 concurrentOps_init == /\ pc["initClient"] = "concurrentOps_init"
                       /\ IF objs_init /= {}
@@ -768,11 +1007,14 @@ concurrentOps_init == /\ pc["initClient"] = "concurrentOps_init"
                                       currentTail, uninitializedObjs, initObj, 
                                       action_init, gateway_cinit, msg_cinit, 
                                       uniqueId_cinit, sentOps_init, 
-                                      recvdOps_init, objs, obj, actions, 
-                                      action, gateway_c, msg_c, uniqueId, 
-                                      sentOps, recvdOps, crashedNode, liveNode, 
-                                      req_z, liveNodes, role, sender, req, 
-                                      pendingInvos, now >>
+                                      recvdOps_init, crashNode, objs, obj, 
+                                      actions, action, gateway_c, msg_c, 
+                                      uniqueId, outstandingOps, crashedNode, 
+                                      sender_zk, liveNode, req_z, liveNodes, 
+                                      role, sender, req, pendingInvos, 
+                                      failoverPendingInvos, now, 
+                                      failoverUnpropagatedWrites, 
+                                      failoverAckdWrites, version, pendingInvo >>
 
 readOrWrite_init == /\ pc["initClient"] = "readOrWrite_init"
                     /\ IF actions_init /= {}
@@ -803,11 +1045,14 @@ readOrWrite_init == /\ pc["initClient"] = "readOrWrite_init"
                                     currentHead, currentTail, 
                                     uninitializedObjs, initObj, objs_init, 
                                     obj_init, gateway_cinit, msg_cinit, 
-                                    recvdOps_init, objs, obj, actions, action, 
-                                    gateway_c, msg_c, uniqueId, sentOps, 
-                                    recvdOps, crashedNode, liveNode, req_z, 
-                                    liveNodes, role, sender, req, pendingInvos, 
-                                    now >>
+                                    recvdOps_init, crashNode, objs, obj, 
+                                    actions, action, gateway_c, msg_c, 
+                                    uniqueId, outstandingOps, crashedNode, 
+                                    sender_zk, liveNode, req_z, liveNodes, 
+                                    role, sender, req, pendingInvos, 
+                                    failoverPendingInvos, now, 
+                                    failoverUnpropagatedWrites, 
+                                    failoverAckdWrites, version, pendingInvo >>
 
 waitForOps_init == /\ pc["initClient"] = "waitForOps_init"
                    /\ IF recvdOps_init < sentOps_init
@@ -834,10 +1079,13 @@ waitForOps_init == /\ pc["initClient"] = "waitForOps_init"
                                    currentTail, uninitializedObjs, initObj, 
                                    objs_init, obj_init, actions_init, 
                                    action_init, uniqueId_cinit, sentOps_init, 
-                                   objs, obj, actions, action, gateway_c, 
-                                   msg_c, uniqueId, sentOps, recvdOps, 
-                                   crashedNode, liveNode, req_z, liveNodes, 
-                                   role, sender, req, pendingInvos, now >>
+                                   crashNode, objs, obj, actions, action, 
+                                   gateway_c, msg_c, uniqueId, outstandingOps, 
+                                   crashedNode, sender_zk, liveNode, req_z, 
+                                   liveNodes, role, sender, req, pendingInvos, 
+                                   failoverPendingInvos, now, 
+                                   failoverUnpropagatedWrites, 
+                                   failoverAckdWrites, version, pendingInvo >>
 
 terminate_init == /\ pc["initClient"] = "terminate_init"
                   /\ terminatedYet' = [terminatedYet EXCEPT ![initClient] = TRUE]
@@ -850,13 +1098,59 @@ terminate_init == /\ pc["initClient"] = "terminate_init"
                                   objs_init, obj_init, actions_init, 
                                   action_init, gateway_cinit, msg_cinit, 
                                   uniqueId_cinit, sentOps_init, recvdOps_init, 
-                                  objs, obj, actions, action, gateway_c, msg_c, 
-                                  uniqueId, sentOps, recvdOps, crashedNode, 
-                                  liveNode, req_z, liveNodes, role, sender, 
-                                  req, pendingInvos, now >>
+                                  crashNode, objs, obj, actions, action, 
+                                  gateway_c, msg_c, uniqueId, outstandingOps, 
+                                  crashedNode, sender_zk, liveNode, req_z, 
+                                  liveNodes, role, sender, req, pendingInvos, 
+                                  failoverPendingInvos, now, 
+                                  failoverUnpropagatedWrites, 
+                                  failoverAckdWrites, version, pendingInvo >>
 
 iclient == initializeObj \/ waitFor_init \/ concurrentOps_init
               \/ readOrWrite_init \/ waitForOps_init \/ terminate_init
+
+waitForInit_crasher == /\ pc["crasher"] = "waitForInit_crasher"
+                       /\ start = TRUE
+                       /\ pc' = [pc EXCEPT !["crasher"] = "initCrash"]
+                       /\ UNCHANGED << msgQs, failoverMsgQs, objLogs, 
+                                       allSubmittedWriteOps, 
+                                       allSubmittedReadOps, terminatedYet, 
+                                       nonInitClients, start, timeOracle, 
+                                       Successors, Predecessors, currentHead, 
+                                       currentTail, uninitializedObjs, initObj, 
+                                       objs_init, obj_init, actions_init, 
+                                       action_init, gateway_cinit, msg_cinit, 
+                                       uniqueId_cinit, sentOps_init, 
+                                       recvdOps_init, crashNode, objs, obj, 
+                                       actions, action, gateway_c, msg_c, 
+                                       uniqueId, outstandingOps, crashedNode, 
+                                       sender_zk, liveNode, req_z, liveNodes, 
+                                       role, sender, req, pendingInvos, 
+                                       failoverPendingInvos, now, 
+                                       failoverUnpropagatedWrites, 
+                                       failoverAckdWrites, version, 
+                                       pendingInvo >>
+
+initCrash == /\ pc["crasher"] = "initCrash"
+             /\ crashNode' = (CHOOSE n \in ActiveNodes: n /= currentHead /\ n /= currentTail)
+             /\ msgQs' = [msgQs EXCEPT ![<<crasherClient, crashNode'>>] = Append(@, ([callType |-> CRASH]))]
+             /\ pc' = [pc EXCEPT !["crasher"] = "Done"]
+             /\ UNCHANGED << failoverMsgQs, objLogs, allSubmittedWriteOps, 
+                             allSubmittedReadOps, terminatedYet, 
+                             nonInitClients, start, timeOracle, Successors, 
+                             Predecessors, currentHead, currentTail, 
+                             uninitializedObjs, initObj, objs_init, obj_init, 
+                             actions_init, action_init, gateway_cinit, 
+                             msg_cinit, uniqueId_cinit, sentOps_init, 
+                             recvdOps_init, objs, obj, actions, action, 
+                             gateway_c, msg_c, uniqueId, outstandingOps, 
+                             crashedNode, sender_zk, liveNode, req_z, 
+                             liveNodes, role, sender, req, pendingInvos, 
+                             failoverPendingInvos, now, 
+                             failoverUnpropagatedWrites, failoverAckdWrites, 
+                             version, pendingInvo >>
+
+crasher == waitForInit_crasher \/ initCrash
 
 waitForInit(self) == /\ pc[self] = "waitForInit"
                      /\ start = TRUE
@@ -869,19 +1163,23 @@ waitForInit(self) == /\ pc[self] = "waitForInit"
                                      uninitializedObjs, initObj, objs_init, 
                                      obj_init, actions_init, action_init, 
                                      gateway_cinit, msg_cinit, uniqueId_cinit, 
-                                     sentOps_init, recvdOps_init, objs, obj, 
-                                     actions, action, gateway_c, msg_c, 
-                                     uniqueId, sentOps, recvdOps, crashedNode, 
-                                     liveNode, req_z, liveNodes, role, sender, 
-                                     req, pendingInvos, now >>
+                                     sentOps_init, recvdOps_init, crashNode, 
+                                     objs, obj, actions, action, gateway_c, 
+                                     msg_c, uniqueId, outstandingOps, 
+                                     crashedNode, sender_zk, liveNode, req_z, 
+                                     liveNodes, role, sender, req, 
+                                     pendingInvos, failoverPendingInvos, now, 
+                                     failoverUnpropagatedWrites, 
+                                     failoverAckdWrites, version, pendingInvo >>
 
 concurrentOps(self) == /\ pc[self] = "concurrentOps"
                        /\ IF objs[self] /= {}
                              THEN /\ obj' = [obj EXCEPT ![self] = CHOOSE o \in objs[self]: TRUE]
                                   /\ objs' = [objs EXCEPT ![self] = objs[self] \ {obj'[self]}]
+                                  /\ actions' = [actions EXCEPT ![self] = {WRITE_INV, READ_INV}]
                                   /\ pc' = [pc EXCEPT ![self] = "readOrWrite"]
                              ELSE /\ pc' = [pc EXCEPT ![self] = "terminate"]
-                                  /\ UNCHANGED << objs, obj >>
+                                  /\ UNCHANGED << objs, obj, actions >>
                        /\ UNCHANGED << msgQs, failoverMsgQs, objLogs, 
                                        allSubmittedWriteOps, 
                                        allSubmittedReadOps, terminatedYet, 
@@ -891,35 +1189,24 @@ concurrentOps(self) == /\ pc[self] = "concurrentOps"
                                        objs_init, obj_init, actions_init, 
                                        action_init, gateway_cinit, msg_cinit, 
                                        uniqueId_cinit, sentOps_init, 
-                                       recvdOps_init, actions, action, 
-                                       gateway_c, msg_c, uniqueId, sentOps, 
-                                       recvdOps, crashedNode, liveNode, req_z, 
-                                       liveNodes, role, sender, req, 
-                                       pendingInvos, now >>
+                                       recvdOps_init, crashNode, action, 
+                                       gateway_c, msg_c, uniqueId, 
+                                       outstandingOps, crashedNode, sender_zk, 
+                                       liveNode, req_z, liveNodes, role, 
+                                       sender, req, pendingInvos, 
+                                       failoverPendingInvos, now, 
+                                       failoverUnpropagatedWrites, 
+                                       failoverAckdWrites, version, 
+                                       pendingInvo >>
 
 readOrWrite(self) == /\ pc[self] = "readOrWrite"
                      /\ IF actions[self] /= {}
                            THEN /\ action' = [action EXCEPT ![self] = CHOOSE a \in actions[self]: TRUE]
                                 /\ actions' = [actions EXCEPT ![self] = actions[self] \ {action'[self]}]
-                                /\ msgQs' = [msgQs EXCEPT ![<<self, (IF action'[self] = WRITE_INV THEN head ELSE CHOOSE n \in Nodes: n /= head)>>] = Append(@, ([   callType |-> action'[self],
-                                                                                                                                                                    uniqueId |-> uniqueId[self],
-                                                                                                                                                                    startTs |-> NullTs,
-                                                                                                                                                                    commitTs |-> NullTs,
-                                                                                                                                                                    op |-> [obj |-> obj[self],
-                                                                                                                                                                            uniqueId |-> uniqueId[self],
-                                                                                                                                                                            writeStartTs |-> NullTs,
-                                                                                                                                                                            writeCommitTs |-> NullTs,
-                                                                                                                                                                            commitStatus |-> IF action'[self] = WRITE_INV
-                                                                                                                                                                                                THEN DIRTY
-                                                                                                                                                                                                ELSE NullCommitStatus]]))]
-                                /\ uniqueId' = [uniqueId EXCEPT ![self] = Increment(uniqueId[self])]
-                                /\ sentOps' = [sentOps EXCEPT ![self] = sentOps[self] + 1]
-                                /\ pc' = [pc EXCEPT ![self] = "waitForOps"]
-                           ELSE /\ actions' = [actions EXCEPT ![self] = {WRITE_INV, READ_INV}]
-                                /\ pc' = [pc EXCEPT ![self] = "concurrentOps"]
-                                /\ UNCHANGED << msgQs, action, uniqueId, 
-                                                sentOps >>
-                     /\ UNCHANGED << failoverMsgQs, objLogs, 
+                                /\ pc' = [pc EXCEPT ![self] = "sendToActiveNode"]
+                           ELSE /\ pc' = [pc EXCEPT ![self] = "concurrentOps"]
+                                /\ UNCHANGED << actions, action >>
+                     /\ UNCHANGED << msgQs, failoverMsgQs, objLogs, 
                                      allSubmittedWriteOps, allSubmittedReadOps, 
                                      terminatedYet, nonInitClients, start, 
                                      timeOracle, Successors, Predecessors, 
@@ -927,42 +1214,89 @@ readOrWrite(self) == /\ pc[self] = "readOrWrite"
                                      uninitializedObjs, initObj, objs_init, 
                                      obj_init, actions_init, action_init, 
                                      gateway_cinit, msg_cinit, uniqueId_cinit, 
-                                     sentOps_init, recvdOps_init, objs, obj, 
-                                     gateway_c, msg_c, recvdOps, crashedNode, 
+                                     sentOps_init, recvdOps_init, crashNode, 
+                                     objs, obj, gateway_c, msg_c, uniqueId, 
+                                     outstandingOps, crashedNode, sender_zk, 
                                      liveNode, req_z, liveNodes, role, sender, 
-                                     req, pendingInvos, now >>
+                                     req, pendingInvos, failoverPendingInvos, 
+                                     now, failoverUnpropagatedWrites, 
+                                     failoverAckdWrites, version, pendingInvo >>
+
+sendToActiveNode(self) == /\ pc[self] = "sendToActiveNode"
+                          /\ IF \/ msg_c[self] = NullReq
+                                \/ msg_c[self].callType = TIMEOUT
+                                THEN /\ msgQs' = [msgQs EXCEPT ![<<self, (IF action[self] = WRITE_INV THEN head ELSE CHOOSE n \in ActiveNodes: n /= head)>>] = Append(@, ([   callType |-> action[self],
+                                                                                                                                                                              uniqueId |-> uniqueId[self],
+                                                                                                                                                                              startTs |-> NullTs,
+                                                                                                                                                                              commitTs |-> NullTs,
+                                                                                                                                                                              op |-> [obj |-> obj[self],
+                                                                                                                                                                                      uniqueId |-> uniqueId[self],
+                                                                                                                                                                                      writeStartTs |-> NullTs,
+                                                                                                                                                                                      writeCommitTs |-> NullTs,
+                                                                                                                                                                                      commitStatus |->    IF action[self] = WRITE_INV
+                                                                                                                                                                                                          THEN DIRTY
+                                                                                                                                                                                                          ELSE NullCommitStatus]]))]
+                                     /\ outstandingOps' = [outstandingOps EXCEPT ![self] = outstandingOps[self] + 1]
+                                     /\ pc' = [pc EXCEPT ![self] = "waitForOps"]
+                                     /\ UNCHANGED << allSubmittedWriteOps, 
+                                                     allSubmittedReadOps, 
+                                                     msg_c, uniqueId >>
+                                ELSE /\ uniqueId' = [uniqueId EXCEPT ![self] = Increment(uniqueId[self])]
+                                     /\ IF msg_c[self].callType = WRITE_RESP
+                                           THEN /\ allSubmittedWriteOps' = [allSubmittedWriteOps EXCEPT ![msg_c[self].op.obj] = allSubmittedWriteOps[msg_c[self].op.obj] \cup {msg_c[self]}]
+                                                /\ UNCHANGED allSubmittedReadOps
+                                           ELSE /\ allSubmittedReadOps' = [allSubmittedReadOps EXCEPT ![msg_c[self].op.obj] = allSubmittedReadOps[msg_c[self].op.obj] \cup {msg_c[self]}]
+                                                /\ UNCHANGED allSubmittedWriteOps
+                                     /\ Assert((msg_c[self].uniqueId[1] = self), 
+                                               "Failure of assertion at line 393, column 17.")
+                                     /\ msg_c' = [msg_c EXCEPT ![self] = NullReq]
+                                     /\ pc' = [pc EXCEPT ![self] = "readOrWrite"]
+                                     /\ UNCHANGED << msgQs, outstandingOps >>
+                          /\ UNCHANGED << failoverMsgQs, objLogs, 
+                                          terminatedYet, nonInitClients, start, 
+                                          timeOracle, Successors, Predecessors, 
+                                          currentHead, currentTail, 
+                                          uninitializedObjs, initObj, 
+                                          objs_init, obj_init, actions_init, 
+                                          action_init, gateway_cinit, 
+                                          msg_cinit, uniqueId_cinit, 
+                                          sentOps_init, recvdOps_init, 
+                                          crashNode, objs, obj, actions, 
+                                          action, gateway_c, crashedNode, 
+                                          sender_zk, liveNode, req_z, 
+                                          liveNodes, role, sender, req, 
+                                          pendingInvos, failoverPendingInvos, 
+                                          now, failoverUnpropagatedWrites, 
+                                          failoverAckdWrites, version, 
+                                          pendingInvo >>
 
 waitForOps(self) == /\ pc[self] = "waitForOps"
-                    /\ IF recvdOps[self] < sentOps[self]
+                    /\ IF outstandingOps[self] > 0
                           THEN /\ \E temp \in {s \in SendersTo(self): msgQs[<<s, self>>] /= << >>}:
-                                    gateway_c' = [gateway_c EXCEPT ![self] = temp]
-                               /\ msgQs[<<gateway_c'[self], self>>] /= << >>
-                               /\ msg_c' = [msg_c EXCEPT ![self] = Head(msgQs[<<gateway_c'[self], self>>])]
-                               /\ msgQs' = [msgQs EXCEPT ![<<gateway_c'[self], self>>] = Tail(@)]
-                               /\ IF msg_c'[self].callType = WRITE_RESP
-                                     THEN /\ allSubmittedWriteOps' = [allSubmittedWriteOps EXCEPT ![msg_c'[self].op.obj] = allSubmittedWriteOps[msg_c'[self].op.obj] \cup {msg_c'[self]}]
-                                          /\ UNCHANGED allSubmittedReadOps
-                                     ELSE /\ allSubmittedReadOps' = [allSubmittedReadOps EXCEPT ![msg_c'[self].op.obj] = allSubmittedReadOps[msg_c'[self].op.obj] \cup {msg_c'[self]}]
-                                          /\ UNCHANGED allSubmittedWriteOps
-                               /\ Assert((msg_c'[self].uniqueId[1] = self), 
-                                         "Failure of assertion at line 350, column 21.")
-                               /\ recvdOps' = [recvdOps EXCEPT ![self] = recvdOps[self] + 1]
+                                    /\ gateway_c' = [gateway_c EXCEPT ![self] = temp]
+                                    /\ outstandingOps' = [outstandingOps EXCEPT ![self] = outstandingOps[self] - 1]
                                /\ pc' = [pc EXCEPT ![self] = "waitForOps"]
-                          ELSE /\ pc' = [pc EXCEPT ![self] = "readOrWrite"]
-                               /\ UNCHANGED << msgQs, allSubmittedWriteOps, 
-                                               allSubmittedReadOps, gateway_c, 
-                                               msg_c, recvdOps >>
-                    /\ UNCHANGED << failoverMsgQs, objLogs, terminatedYet, 
-                                    nonInitClients, start, timeOracle, 
-                                    Successors, Predecessors, currentHead, 
-                                    currentTail, uninitializedObjs, initObj, 
-                                    objs_init, obj_init, actions_init, 
-                                    action_init, gateway_cinit, msg_cinit, 
-                                    uniqueId_cinit, sentOps_init, 
-                                    recvdOps_init, objs, obj, actions, action, 
-                                    uniqueId, sentOps, crashedNode, liveNode, 
-                                    req_z, liveNodes, role, sender, req, 
-                                    pendingInvos, now >>
+                               /\ UNCHANGED << msgQs, msg_c >>
+                          ELSE /\ msgQs[<<gateway_c[self], self>>] /= << >>
+                               /\ msg_c' = [msg_c EXCEPT ![self] = Head(msgQs[<<gateway_c[self], self>>])]
+                               /\ msgQs' = [msgQs EXCEPT ![<<gateway_c[self], self>>] = Tail(@)]
+                               /\ pc' = [pc EXCEPT ![self] = "sendToActiveNode"]
+                               /\ UNCHANGED << gateway_c, outstandingOps >>
+                    /\ UNCHANGED << failoverMsgQs, objLogs, 
+                                    allSubmittedWriteOps, allSubmittedReadOps, 
+                                    terminatedYet, nonInitClients, start, 
+                                    timeOracle, Successors, Predecessors, 
+                                    currentHead, currentTail, 
+                                    uninitializedObjs, initObj, objs_init, 
+                                    obj_init, actions_init, action_init, 
+                                    gateway_cinit, msg_cinit, uniqueId_cinit, 
+                                    sentOps_init, recvdOps_init, crashNode, 
+                                    objs, obj, actions, action, uniqueId, 
+                                    crashedNode, sender_zk, liveNode, req_z, 
+                                    liveNodes, role, sender, req, pendingInvos, 
+                                    failoverPendingInvos, now, 
+                                    failoverUnpropagatedWrites, 
+                                    failoverAckdWrites, version, pendingInvo >>
 
 terminate(self) == /\ pc[self] = "terminate"
                    /\ terminatedYet' = [terminatedYet EXCEPT ![self] = TRUE]
@@ -975,41 +1309,111 @@ terminate(self) == /\ pc[self] = "terminate"
                                    objs_init, obj_init, actions_init, 
                                    action_init, gateway_cinit, msg_cinit, 
                                    uniqueId_cinit, sentOps_init, recvdOps_init, 
-                                   objs, obj, actions, action, gateway_c, 
-                                   msg_c, uniqueId, sentOps, recvdOps, 
-                                   crashedNode, liveNode, req_z, liveNodes, 
-                                   role, sender, req, pendingInvos, now >>
+                                   crashNode, objs, obj, actions, action, 
+                                   gateway_c, msg_c, uniqueId, outstandingOps, 
+                                   crashedNode, sender_zk, liveNode, req_z, 
+                                   liveNodes, role, sender, req, pendingInvos, 
+                                   failoverPendingInvos, now, 
+                                   failoverUnpropagatedWrites, 
+                                   failoverAckdWrites, version, pendingInvo >>
 
 c(self) == waitForInit(self) \/ concurrentOps(self) \/ readOrWrite(self)
-              \/ waitForOps(self) \/ terminate(self)
+              \/ sendToActiveNode(self) \/ waitForOps(self)
+              \/ terminate(self)
 
 listen_z == /\ pc["zookeeper"] = "listen_z"
             /\ \E temp \in {s \in SendersTo(Zookeeper): msgQs[<<s, Zookeeper>>] /= << >>}:
-                 crashedNode' = temp
-            /\ msgQs[<<crashedNode', Zookeeper>>] /= << >>
-            /\ req_z' = Head(msgQs[<<crashedNode', Zookeeper>>])
-            /\ msgQs' = [msgQs EXCEPT ![<<crashedNode', Zookeeper>>] = Tail(@)]
+                 sender_zk' = temp
+            /\ msgQs[<<sender_zk', Zookeeper>>] /= << >>
+            /\ req_z' = Head(msgQs[<<sender_zk', Zookeeper>>])
+            /\ msgQs' = [msgQs EXCEPT ![<<sender_zk', Zookeeper>>] = Tail(@)]
             /\ IF req_z'.callType = ZK_SESSION_ENDED
-                  THEN /\ pc' = [pc EXCEPT !["zookeeper"] = "triggerWatches"]
-                  ELSE /\ pc' = [pc EXCEPT !["zookeeper"] = "listen_z"]
+                  THEN /\ crashedNode' = sender_zk'
+                       /\ liveNodes' = Nodes \ {crashedNode'}
+                       /\ pc' = [pc EXCEPT !["zookeeper"] = "triggerWatchesNodeDel"]
+                  ELSE /\ IF req_z'.callType = ZK_CREATE
+                             THEN /\ liveNodes' = Nodes
+                                  /\ pc' = [pc EXCEPT !["zookeeper"] = "triggerWatchesNodeAdd"]
+                             ELSE /\ pc' = [pc EXCEPT !["zookeeper"] = "listen_z"]
+                                  /\ UNCHANGED liveNodes
+                       /\ UNCHANGED crashedNode
             /\ UNCHANGED << failoverMsgQs, objLogs, allSubmittedWriteOps, 
                             allSubmittedReadOps, terminatedYet, nonInitClients, 
                             start, timeOracle, Successors, Predecessors, 
                             currentHead, currentTail, uninitializedObjs, 
                             initObj, objs_init, obj_init, actions_init, 
                             action_init, gateway_cinit, msg_cinit, 
-                            uniqueId_cinit, sentOps_init, recvdOps_init, objs, 
-                            obj, actions, action, gateway_c, msg_c, uniqueId, 
-                            sentOps, recvdOps, liveNode, liveNodes, role, 
-                            sender, req, pendingInvos, now >>
+                            uniqueId_cinit, sentOps_init, recvdOps_init, 
+                            crashNode, objs, obj, actions, action, gateway_c, 
+                            msg_c, uniqueId, outstandingOps, liveNode, role, 
+                            sender, req, pendingInvos, failoverPendingInvos, 
+                            now, failoverUnpropagatedWrites, 
+                            failoverAckdWrites, version, pendingInvo >>
 
-triggerWatches == /\ pc["zookeeper"] = "triggerWatches"
-                  /\ IF liveNodes /= {crashedNode}
-                        THEN /\ liveNode' = (CHOOSE ln \in liveNodes: ln /= crashedNode)
-                             /\ msgQs' = [msgQs EXCEPT ![<<Zookeeper, liveNode'>>] = Append(@, ([ callType    |-> ZK_NODE_DEL,
-                                                                                                  crashedNode  |-> crashedNode]))]
+triggerWatchesNodeDel == /\ pc["zookeeper"] = "triggerWatchesNodeDel"
+                         /\ IF liveNodes /= {}
+                               THEN /\ liveNode' = (CHOOSE ln \in liveNodes: TRUE)
+                                    /\ msgQs' = [msgQs EXCEPT ![<<Zookeeper, liveNode'>>] = Append(@, ([ callType    |-> ZK_NODE_DEL,
+                                                                                                         crashedNode  |-> crashedNode]))]
+                                    /\ liveNodes' = liveNodes \ {liveNode'}
+                                    /\ pc' = [pc EXCEPT !["zookeeper"] = "triggerWatchesNodeDel"]
+                               ELSE /\ pc' = [pc EXCEPT !["zookeeper"] = "listen_z"]
+                                    /\ UNCHANGED << msgQs, liveNode, liveNodes >>
+                         /\ UNCHANGED << failoverMsgQs, objLogs, 
+                                         allSubmittedWriteOps, 
+                                         allSubmittedReadOps, terminatedYet, 
+                                         nonInitClients, start, timeOracle, 
+                                         Successors, Predecessors, currentHead, 
+                                         currentTail, uninitializedObjs, 
+                                         initObj, objs_init, obj_init, 
+                                         actions_init, action_init, 
+                                         gateway_cinit, msg_cinit, 
+                                         uniqueId_cinit, sentOps_init, 
+                                         recvdOps_init, crashNode, objs, obj, 
+                                         actions, action, gateway_c, msg_c, 
+                                         uniqueId, outstandingOps, crashedNode, 
+                                         sender_zk, req_z, role, sender, req, 
+                                         pendingInvos, failoverPendingInvos, 
+                                         now, failoverUnpropagatedWrites, 
+                                         failoverAckdWrites, version, 
+                                         pendingInvo >>
+
+triggerWatchesNodeAdd == /\ pc["zookeeper"] = "triggerWatchesNodeAdd"
+                         /\ IF liveNodes /= {}
+                               THEN /\ liveNode' = (CHOOSE ln \in liveNodes : TRUE)
+                                    /\ failoverMsgQs' = [failoverMsgQs EXCEPT ![<<Zookeeper, liveNode'>>] = Append(@, ([ callType |-> ZK_NODE_ADD]))]
+                                    /\ liveNodes' = liveNodes \ {liveNode'}
+                                    /\ pc' = [pc EXCEPT !["zookeeper"] = "triggerWatchesNodeAdd"]
+                               ELSE /\ liveNodes' = Clients
+                                    /\ pc' = [pc EXCEPT !["zookeeper"] = "timeoutClients"]
+                                    /\ UNCHANGED << failoverMsgQs, liveNode >>
+                         /\ UNCHANGED << msgQs, objLogs, allSubmittedWriteOps, 
+                                         allSubmittedReadOps, terminatedYet, 
+                                         nonInitClients, start, timeOracle, 
+                                         Successors, Predecessors, currentHead, 
+                                         currentTail, uninitializedObjs, 
+                                         initObj, objs_init, obj_init, 
+                                         actions_init, action_init, 
+                                         gateway_cinit, msg_cinit, 
+                                         uniqueId_cinit, sentOps_init, 
+                                         recvdOps_init, crashNode, objs, obj, 
+                                         actions, action, gateway_c, msg_c, 
+                                         uniqueId, outstandingOps, crashedNode, 
+                                         sender_zk, req_z, role, sender, req, 
+                                         pendingInvos, failoverPendingInvos, 
+                                         now, failoverUnpropagatedWrites, 
+                                         failoverAckdWrites, version, 
+                                         pendingInvo >>
+
+timeoutClients == /\ pc["zookeeper"] = "timeoutClients"
+                  /\ IF liveNodes /= {}
+                        THEN /\ liveNode' = (CHOOSE client \in liveNodes : TRUE)
                              /\ liveNodes' = liveNodes \ {liveNode'}
-                             /\ pc' = [pc EXCEPT !["zookeeper"] = "triggerWatches"]
+                             /\ IF msgQs[<<liveNode', crashedNode>>] /= << >>
+                                   THEN /\ msgQs' = [msgQs EXCEPT ![<<Zookeeper, liveNode'>>] = Append(@, ([callType |-> TIMEOUT]))]
+                                   ELSE /\ TRUE
+                                        /\ msgQs' = msgQs
+                             /\ pc' = [pc EXCEPT !["zookeeper"] = "timeoutClients"]
                         ELSE /\ pc' = [pc EXCEPT !["zookeeper"] = "listen_z"]
                              /\ UNCHANGED << msgQs, liveNode, liveNodes >>
                   /\ UNCHANGED << failoverMsgQs, objLogs, allSubmittedWriteOps, 
@@ -1020,11 +1424,15 @@ triggerWatches == /\ pc["zookeeper"] = "triggerWatches"
                                   objs_init, obj_init, actions_init, 
                                   action_init, gateway_cinit, msg_cinit, 
                                   uniqueId_cinit, sentOps_init, recvdOps_init, 
-                                  objs, obj, actions, action, gateway_c, msg_c, 
-                                  uniqueId, sentOps, recvdOps, crashedNode, 
-                                  req_z, role, sender, req, pendingInvos, now >>
+                                  crashNode, objs, obj, actions, action, 
+                                  gateway_c, msg_c, uniqueId, outstandingOps, 
+                                  crashedNode, sender_zk, req_z, role, sender, 
+                                  req, pendingInvos, failoverPendingInvos, now, 
+                                  failoverUnpropagatedWrites, 
+                                  failoverAckdWrites, version, pendingInvo >>
 
-zk == listen_z \/ triggerWatches
+zk == listen_z \/ triggerWatchesNodeDel \/ triggerWatchesNodeAdd
+         \/ timeoutClients
 
 roleAssignment(self) == /\ pc[self] = "roleAssignment"
                         /\ role' = [role EXCEPT ![self] = CASE self = head -> HEAD
@@ -1041,11 +1449,15 @@ roleAssignment(self) == /\ pc[self] = "roleAssignment"
                                         actions_init, action_init, 
                                         gateway_cinit, msg_cinit, 
                                         uniqueId_cinit, sentOps_init, 
-                                        recvdOps_init, objs, obj, actions, 
-                                        action, gateway_c, msg_c, uniqueId, 
-                                        sentOps, recvdOps, crashedNode, 
-                                        liveNode, req_z, liveNodes, sender, 
-                                        req, pendingInvos, now >>
+                                        recvdOps_init, crashNode, objs, obj, 
+                                        actions, action, gateway_c, msg_c, 
+                                        uniqueId, outstandingOps, crashedNode, 
+                                        sender_zk, liveNode, req_z, liveNodes, 
+                                        sender, req, pendingInvos, 
+                                        failoverPendingInvos, now, 
+                                        failoverUnpropagatedWrites, 
+                                        failoverAckdWrites, version, 
+                                        pendingInvo >>
 
 listen(self) == /\ pc[self] = "listen"
                 /\ \E temp \in {s \in SendersTo(self): msgQs[<<s, self>>] /= << >>}:
@@ -1065,9 +1477,11 @@ listen(self) == /\ pc[self] = "listen"
                                                                   ELSE /\ IF req'[self].callType = CRASH
                                                                              THEN /\ pc' = [pc EXCEPT ![self] = "crash"]
                                                                              ELSE /\ IF req'[self].callType = ZK_NODE_DEL
-                                                                                        THEN /\ IF Successors[self] = req'[self].crashedNode
-                                                                                                   THEN /\ pc' = [pc EXCEPT ![self] = "failoverCrashedNodePredecessor"]
-                                                                                                   ELSE /\ pc' = [pc EXCEPT ![self] = "listen"]
+                                                                                        THEN /\ IF req'[self].crashedNode = Successors[self]
+                                                                                                   THEN /\ pc' = [pc EXCEPT ![self] = "failoverCrashedNodeIsSuccessor"]
+                                                                                                   ELSE /\ IF req'[self].crashedNode = Predecessors[self]
+                                                                                                              THEN /\ pc' = [pc EXCEPT ![self] = "failoverCrashedNodeIsPredecessor"]
+                                                                                                              ELSE /\ pc' = [pc EXCEPT ![self] = "failoverListen"]
                                                                                         ELSE /\ pc' = [pc EXCEPT ![self] = "listen"]
                       ELSE /\ IF role[self] = TAIL
                                  THEN /\ IF req'[self].callType = READ_INV
@@ -1076,7 +1490,11 @@ listen(self) == /\ pc[self] = "listen"
                                                        THEN /\ pc' = [pc EXCEPT ![self] = "handleWriteInvTail"]
                                                        ELSE /\ IF req'[self].callType = CRASH
                                                                   THEN /\ pc' = [pc EXCEPT ![self] = "crash"]
-                                                                  ELSE /\ pc' = [pc EXCEPT ![self] = "listen"]
+                                                                  ELSE /\ IF req'[self].callType = ZK_NODE_DEL
+                                                                             THEN /\ IF Predecessors[self] = req'[self].crashedNode
+                                                                                        THEN /\ pc' = [pc EXCEPT ![self] = "failoverCrashedNodeIsPredecessor"]
+                                                                                        ELSE /\ pc' = [pc EXCEPT ![self] = "failoverListen"]
+                                                                             ELSE /\ pc' = [pc EXCEPT ![self] = "listen"]
                                  ELSE /\ IF req'[self].callType = READ_INV
                                             THEN /\ pc' = [pc EXCEPT ![self] = "handleReadInv"]
                                             ELSE /\ IF req'[self].callType = READ_RESP
@@ -1087,7 +1505,13 @@ listen(self) == /\ pc[self] = "listen"
                                                                              THEN /\ pc' = [pc EXCEPT ![self] = "handleWriteResp"]
                                                                              ELSE /\ IF req'[self].callType = CRASH
                                                                                         THEN /\ pc' = [pc EXCEPT ![self] = "crash"]
-                                                                                        ELSE /\ pc' = [pc EXCEPT ![self] = "listen"]
+                                                                                        ELSE /\ IF req'[self].callType = ZK_NODE_DEL
+                                                                                                   THEN /\ IF req'[self].crashedNode = Successors[self]
+                                                                                                              THEN /\ pc' = [pc EXCEPT ![self] = "failoverCrashedNodeIsSuccessor"]
+                                                                                                              ELSE /\ IF req'[self].crashedNode = Predecessors[self]
+                                                                                                                         THEN /\ pc' = [pc EXCEPT ![self] = "failoverCrashedNodeIsPredecessor"]
+                                                                                                                         ELSE /\ pc' = [pc EXCEPT ![self] = "failoverListen"]
+                                                                                                   ELSE /\ pc' = [pc EXCEPT ![self] = "listen"]
                 /\ UNCHANGED << failoverMsgQs, objLogs, allSubmittedWriteOps, 
                                 allSubmittedReadOps, terminatedYet, 
                                 nonInitClients, start, timeOracle, Successors, 
@@ -1095,17 +1519,30 @@ listen(self) == /\ pc[self] = "listen"
                                 uninitializedObjs, initObj, objs_init, 
                                 obj_init, actions_init, action_init, 
                                 gateway_cinit, msg_cinit, uniqueId_cinit, 
-                                sentOps_init, recvdOps_init, objs, obj, 
-                                actions, action, gateway_c, msg_c, uniqueId, 
-                                sentOps, recvdOps, crashedNode, liveNode, 
-                                req_z, liveNodes, role, pendingInvos, now >>
+                                sentOps_init, recvdOps_init, crashNode, objs, 
+                                obj, actions, action, gateway_c, msg_c, 
+                                uniqueId, outstandingOps, crashedNode, 
+                                sender_zk, liveNode, req_z, liveNodes, role, 
+                                pendingInvos, failoverPendingInvos, now, 
+                                failoverUnpropagatedWrites, failoverAckdWrites, 
+                                version, pendingInvo >>
 
 failoverListen(self) == /\ pc[self] = "failoverListen"
                         /\ \E temp \in {s \in SendersTo(self): failoverMsgQs[<<s, self>>] /= << >>}:
                              sender' = [sender EXCEPT ![self] = temp]
-                        /\ pc' = [pc EXCEPT ![self] = "failoverListen"]
-                        /\ UNCHANGED << msgQs, failoverMsgQs, objLogs, 
-                                        allSubmittedWriteOps, 
+                        /\ failoverMsgQs[<<sender'[self], self>>] /= << >>
+                        /\ req' = [req EXCEPT ![self] = Head(failoverMsgQs[<<sender'[self], self>>])]
+                        /\ failoverMsgQs' = [failoverMsgQs EXCEPT ![<<sender'[self], self>>] = Tail(@)]
+                        /\ IF req'[self].callType = FAILOVER_NOTIFY_TAIL
+                              THEN /\ IF role[self] = TAIL
+                                         THEN /\ pc' = [pc EXCEPT ![self] = "failoverTailPropsLog"]
+                                         ELSE /\ pc' = [pc EXCEPT ![self] = "failoverListen"]
+                              ELSE /\ IF req'[self].callType = FAILOVER_PROPAGATE_LOG
+                                         THEN /\ pc' = [pc EXCEPT ![self] = "failoverAssumeNewTail"]
+                                         ELSE /\ IF req'[self].callType = ZK_NODE_ADD
+                                                    THEN /\ pc' = [pc EXCEPT ![self] = "listen"]
+                                                    ELSE /\ pc' = [pc EXCEPT ![self] = "failoverListen"]
+                        /\ UNCHANGED << msgQs, objLogs, allSubmittedWriteOps, 
                                         allSubmittedReadOps, terminatedYet, 
                                         nonInitClients, start, timeOracle, 
                                         Successors, Predecessors, currentHead, 
@@ -1114,11 +1551,15 @@ failoverListen(self) == /\ pc[self] = "failoverListen"
                                         actions_init, action_init, 
                                         gateway_cinit, msg_cinit, 
                                         uniqueId_cinit, sentOps_init, 
-                                        recvdOps_init, objs, obj, actions, 
-                                        action, gateway_c, msg_c, uniqueId, 
-                                        sentOps, recvdOps, crashedNode, 
-                                        liveNode, req_z, liveNodes, role, req, 
-                                        pendingInvos, now >>
+                                        recvdOps_init, crashNode, objs, obj, 
+                                        actions, action, gateway_c, msg_c, 
+                                        uniqueId, outstandingOps, crashedNode, 
+                                        sender_zk, liveNode, req_z, liveNodes, 
+                                        role, pendingInvos, 
+                                        failoverPendingInvos, now, 
+                                        failoverUnpropagatedWrites, 
+                                        failoverAckdWrites, version, 
+                                        pendingInvo >>
 
 handleReadInv(self) == /\ pc[self] = "handleReadInv"
                        /\ IF IsDirty(self, req[self].op.obj)
@@ -1142,11 +1583,15 @@ handleReadInv(self) == /\ pc[self] = "handleReadInv"
                                        obj_init, actions_init, action_init, 
                                        gateway_cinit, msg_cinit, 
                                        uniqueId_cinit, sentOps_init, 
-                                       recvdOps_init, objs, obj, actions, 
-                                       action, gateway_c, msg_c, uniqueId, 
-                                       sentOps, recvdOps, crashedNode, 
-                                       liveNode, req_z, liveNodes, role, 
-                                       sender, pendingInvos >>
+                                       recvdOps_init, crashNode, objs, obj, 
+                                       actions, action, gateway_c, msg_c, 
+                                       uniqueId, outstandingOps, crashedNode, 
+                                       sender_zk, liveNode, req_z, liveNodes, 
+                                       role, sender, pendingInvos, 
+                                       failoverPendingInvos, 
+                                       failoverUnpropagatedWrites, 
+                                       failoverAckdWrites, version, 
+                                       pendingInvo >>
 
 apportionQ(self) == /\ pc[self] = "apportionQ"
                     /\ msgQs' = [msgQs EXCEPT ![<<self, currentTail>>] = Append(@, req[self])]
@@ -1160,11 +1605,14 @@ apportionQ(self) == /\ pc[self] = "apportionQ"
                                     uninitializedObjs, initObj, objs_init, 
                                     obj_init, actions_init, action_init, 
                                     gateway_cinit, msg_cinit, uniqueId_cinit, 
-                                    sentOps_init, recvdOps_init, objs, obj, 
-                                    actions, action, gateway_c, msg_c, 
-                                    uniqueId, sentOps, recvdOps, crashedNode, 
-                                    liveNode, req_z, liveNodes, role, sender, 
-                                    req, now >>
+                                    sentOps_init, recvdOps_init, crashNode, 
+                                    objs, obj, actions, action, gateway_c, 
+                                    msg_c, uniqueId, outstandingOps, 
+                                    crashedNode, sender_zk, liveNode, req_z, 
+                                    liveNodes, role, sender, req, 
+                                    failoverPendingInvos, now, 
+                                    failoverUnpropagatedWrites, 
+                                    failoverAckdWrites, version, pendingInvo >>
 
 finishReadInv(self) == /\ pc[self] = "finishReadInv"
                        /\ pc' = [pc EXCEPT ![self] = "listen"]
@@ -1177,11 +1625,15 @@ finishReadInv(self) == /\ pc[self] = "finishReadInv"
                                        objs_init, obj_init, actions_init, 
                                        action_init, gateway_cinit, msg_cinit, 
                                        uniqueId_cinit, sentOps_init, 
-                                       recvdOps_init, objs, obj, actions, 
-                                       action, gateway_c, msg_c, uniqueId, 
-                                       sentOps, recvdOps, crashedNode, 
-                                       liveNode, req_z, liveNodes, role, 
-                                       sender, req, pendingInvos, now >>
+                                       recvdOps_init, crashNode, objs, obj, 
+                                       actions, action, gateway_c, msg_c, 
+                                       uniqueId, outstandingOps, crashedNode, 
+                                       sender_zk, liveNode, req_z, liveNodes, 
+                                       role, sender, req, pendingInvos, 
+                                       failoverPendingInvos, now, 
+                                       failoverUnpropagatedWrites, 
+                                       failoverAckdWrites, version, 
+                                       pendingInvo >>
 
 handleReadInvTail(self) == /\ pc[self] = "handleReadInvTail"
                            /\ now' = [now EXCEPT ![self] = timeOracle]
@@ -1203,11 +1655,15 @@ handleReadInvTail(self) == /\ pc[self] = "handleReadInvTail"
                                            actions_init, action_init, 
                                            gateway_cinit, msg_cinit, 
                                            uniqueId_cinit, sentOps_init, 
-                                           recvdOps_init, objs, obj, actions, 
-                                           action, gateway_c, msg_c, uniqueId, 
-                                           sentOps, recvdOps, crashedNode, 
-                                           liveNode, req_z, liveNodes, role, 
-                                           sender, pendingInvos >>
+                                           recvdOps_init, crashNode, objs, obj, 
+                                           actions, action, gateway_c, msg_c, 
+                                           uniqueId, outstandingOps, 
+                                           crashedNode, sender_zk, liveNode, 
+                                           req_z, liveNodes, role, sender, 
+                                           pendingInvos, failoverPendingInvos, 
+                                           failoverUnpropagatedWrites, 
+                                           failoverAckdWrites, version, 
+                                           pendingInvo >>
 
 finishReadInvTail(self) == /\ pc[self] = "finishReadInvTail"
                            /\ pc' = [pc EXCEPT ![self] = "listen"]
@@ -1221,12 +1677,16 @@ finishReadInvTail(self) == /\ pc[self] = "finishReadInvTail"
                                            objs_init, obj_init, actions_init, 
                                            action_init, gateway_cinit, 
                                            msg_cinit, uniqueId_cinit, 
-                                           sentOps_init, recvdOps_init, objs, 
-                                           obj, actions, action, gateway_c, 
-                                           msg_c, uniqueId, sentOps, recvdOps, 
-                                           crashedNode, liveNode, req_z, 
+                                           sentOps_init, recvdOps_init, 
+                                           crashNode, objs, obj, actions, 
+                                           action, gateway_c, msg_c, uniqueId, 
+                                           outstandingOps, crashedNode, 
+                                           sender_zk, liveNode, req_z, 
                                            liveNodes, role, sender, req, 
-                                           pendingInvos, now >>
+                                           pendingInvos, failoverPendingInvos, 
+                                           now, failoverUnpropagatedWrites, 
+                                           failoverAckdWrites, version, 
+                                           pendingInvo >>
 
 handleReadResp(self) == /\ pc[self] = "handleReadResp"
                         /\ msgQs' = [msgQs EXCEPT ![<<self, (Find(pendingInvos[self], req[self].uniqueId))>>] = Append(@, req[self])]
@@ -1242,11 +1702,15 @@ handleReadResp(self) == /\ pc[self] = "handleReadResp"
                                         actions_init, action_init, 
                                         gateway_cinit, msg_cinit, 
                                         uniqueId_cinit, sentOps_init, 
-                                        recvdOps_init, objs, obj, actions, 
-                                        action, gateway_c, msg_c, uniqueId, 
-                                        sentOps, recvdOps, crashedNode, 
-                                        liveNode, req_z, liveNodes, role, 
-                                        sender, req, now >>
+                                        recvdOps_init, crashNode, objs, obj, 
+                                        actions, action, gateway_c, msg_c, 
+                                        uniqueId, outstandingOps, crashedNode, 
+                                        sender_zk, liveNode, req_z, liveNodes, 
+                                        role, sender, req, 
+                                        failoverPendingInvos, now, 
+                                        failoverUnpropagatedWrites, 
+                                        failoverAckdWrites, version, 
+                                        pendingInvo >>
 
 finishReadResp(self) == /\ pc[self] = "finishReadResp"
                         /\ pc' = [pc EXCEPT ![self] = "listen"]
@@ -1260,11 +1724,15 @@ finishReadResp(self) == /\ pc[self] = "finishReadResp"
                                         actions_init, action_init, 
                                         gateway_cinit, msg_cinit, 
                                         uniqueId_cinit, sentOps_init, 
-                                        recvdOps_init, objs, obj, actions, 
-                                        action, gateway_c, msg_c, uniqueId, 
-                                        sentOps, recvdOps, crashedNode, 
-                                        liveNode, req_z, liveNodes, role, 
-                                        sender, req, pendingInvos, now >>
+                                        recvdOps_init, crashNode, objs, obj, 
+                                        actions, action, gateway_c, msg_c, 
+                                        uniqueId, outstandingOps, crashedNode, 
+                                        sender_zk, liveNode, req_z, liveNodes, 
+                                        role, sender, req, pendingInvos, 
+                                        failoverPendingInvos, now, 
+                                        failoverUnpropagatedWrites, 
+                                        failoverAckdWrites, version, 
+                                        pendingInvo >>
 
 handleWriteInvHead(self) == /\ pc[self] = "handleWriteInvHead"
                             /\ now' = [now EXCEPT ![self] = timeOracle]
@@ -1286,11 +1754,15 @@ handleWriteInvHead(self) == /\ pc[self] = "handleWriteInvHead"
                                             actions_init, action_init, 
                                             gateway_cinit, msg_cinit, 
                                             uniqueId_cinit, sentOps_init, 
-                                            recvdOps_init, objs, obj, actions, 
-                                            action, gateway_c, msg_c, uniqueId, 
-                                            sentOps, recvdOps, crashedNode, 
-                                            liveNode, req_z, liveNodes, role, 
-                                            sender >>
+                                            recvdOps_init, crashNode, objs, 
+                                            obj, actions, action, gateway_c, 
+                                            msg_c, uniqueId, outstandingOps, 
+                                            crashedNode, sender_zk, liveNode, 
+                                            req_z, liveNodes, role, sender, 
+                                            failoverPendingInvos, 
+                                            failoverUnpropagatedWrites, 
+                                            failoverAckdWrites, version, 
+                                            pendingInvo >>
 
 finishWriteInvHead(self) == /\ pc[self] = "finishWriteInvHead"
                             /\ pc' = [pc EXCEPT ![self] = "listen"]
@@ -1304,12 +1776,16 @@ finishWriteInvHead(self) == /\ pc[self] = "finishWriteInvHead"
                                             objs_init, obj_init, actions_init, 
                                             action_init, gateway_cinit, 
                                             msg_cinit, uniqueId_cinit, 
-                                            sentOps_init, recvdOps_init, objs, 
-                                            obj, actions, action, gateway_c, 
-                                            msg_c, uniqueId, sentOps, recvdOps, 
-                                            crashedNode, liveNode, req_z, 
+                                            sentOps_init, recvdOps_init, 
+                                            crashNode, objs, obj, actions, 
+                                            action, gateway_c, msg_c, uniqueId, 
+                                            outstandingOps, crashedNode, 
+                                            sender_zk, liveNode, req_z, 
                                             liveNodes, role, sender, req, 
-                                            pendingInvos, now >>
+                                            pendingInvos, failoverPendingInvos, 
+                                            now, failoverUnpropagatedWrites, 
+                                            failoverAckdWrites, version, 
+                                            pendingInvo >>
 
 handleWriteInv(self) == /\ pc[self] = "handleWriteInv"
                         /\ objLogs' = [objLogs EXCEPT ![self][(req[self].op).obj] = Cons((req[self].op), @)]
@@ -1325,11 +1801,15 @@ handleWriteInv(self) == /\ pc[self] = "handleWriteInv"
                                         actions_init, action_init, 
                                         gateway_cinit, msg_cinit, 
                                         uniqueId_cinit, sentOps_init, 
-                                        recvdOps_init, objs, obj, actions, 
-                                        action, gateway_c, msg_c, uniqueId, 
-                                        sentOps, recvdOps, crashedNode, 
-                                        liveNode, req_z, liveNodes, role, 
-                                        sender, req, now >>
+                                        recvdOps_init, crashNode, objs, obj, 
+                                        actions, action, gateway_c, msg_c, 
+                                        uniqueId, outstandingOps, crashedNode, 
+                                        sender_zk, liveNode, req_z, liveNodes, 
+                                        role, sender, req, 
+                                        failoverPendingInvos, now, 
+                                        failoverUnpropagatedWrites, 
+                                        failoverAckdWrites, version, 
+                                        pendingInvo >>
 
 finishWriteInv(self) == /\ pc[self] = "finishWriteInv"
                         /\ pc' = [pc EXCEPT ![self] = "listen"]
@@ -1343,11 +1823,15 @@ finishWriteInv(self) == /\ pc[self] = "finishWriteInv"
                                         actions_init, action_init, 
                                         gateway_cinit, msg_cinit, 
                                         uniqueId_cinit, sentOps_init, 
-                                        recvdOps_init, objs, obj, actions, 
-                                        action, gateway_c, msg_c, uniqueId, 
-                                        sentOps, recvdOps, crashedNode, 
-                                        liveNode, req_z, liveNodes, role, 
-                                        sender, req, pendingInvos, now >>
+                                        recvdOps_init, crashNode, objs, obj, 
+                                        actions, action, gateway_c, msg_c, 
+                                        uniqueId, outstandingOps, crashedNode, 
+                                        sender_zk, liveNode, req_z, liveNodes, 
+                                        role, sender, req, pendingInvos, 
+                                        failoverPendingInvos, now, 
+                                        failoverUnpropagatedWrites, 
+                                        failoverAckdWrites, version, 
+                                        pendingInvo >>
 
 handleWriteInvTail(self) == /\ pc[self] = "handleWriteInvTail"
                             /\ now' = [now EXCEPT ![self] = timeOracle]
@@ -1366,11 +1850,16 @@ handleWriteInvTail(self) == /\ pc[self] = "handleWriteInvTail"
                                             actions_init, action_init, 
                                             gateway_cinit, msg_cinit, 
                                             uniqueId_cinit, sentOps_init, 
-                                            recvdOps_init, objs, obj, actions, 
-                                            action, gateway_c, msg_c, uniqueId, 
-                                            sentOps, recvdOps, crashedNode, 
-                                            liveNode, req_z, liveNodes, role, 
-                                            sender, req, pendingInvos >>
+                                            recvdOps_init, crashNode, objs, 
+                                            obj, actions, action, gateway_c, 
+                                            msg_c, uniqueId, outstandingOps, 
+                                            crashedNode, sender_zk, liveNode, 
+                                            req_z, liveNodes, role, sender, 
+                                            req, pendingInvos, 
+                                            failoverPendingInvos, 
+                                            failoverUnpropagatedWrites, 
+                                            failoverAckdWrites, version, 
+                                            pendingInvo >>
 
 tailAck(self) == /\ pc[self] = "tailAck"
                  /\ req' = [req EXCEPT ![self] = [   callType |-> WRITE_RESP,
@@ -1387,11 +1876,13 @@ tailAck(self) == /\ pc[self] = "tailAck"
                                  uninitializedObjs, initObj, objs_init, 
                                  obj_init, actions_init, action_init, 
                                  gateway_cinit, msg_cinit, uniqueId_cinit, 
-                                 sentOps_init, recvdOps_init, objs, obj, 
-                                 actions, action, gateway_c, msg_c, uniqueId, 
-                                 sentOps, recvdOps, crashedNode, liveNode, 
-                                 req_z, liveNodes, role, sender, pendingInvos, 
-                                 now >>
+                                 sentOps_init, recvdOps_init, crashNode, objs, 
+                                 obj, actions, action, gateway_c, msg_c, 
+                                 uniqueId, outstandingOps, crashedNode, 
+                                 sender_zk, liveNode, req_z, liveNodes, role, 
+                                 sender, pendingInvos, failoverPendingInvos, 
+                                 now, failoverUnpropagatedWrites, 
+                                 failoverAckdWrites, version, pendingInvo >>
 
 finishWriteInvTail(self) == /\ pc[self] = "finishWriteInvTail"
                             /\ pc' = [pc EXCEPT ![self] = "listen"]
@@ -1405,12 +1896,16 @@ finishWriteInvTail(self) == /\ pc[self] = "finishWriteInvTail"
                                             objs_init, obj_init, actions_init, 
                                             action_init, gateway_cinit, 
                                             msg_cinit, uniqueId_cinit, 
-                                            sentOps_init, recvdOps_init, objs, 
-                                            obj, actions, action, gateway_c, 
-                                            msg_c, uniqueId, sentOps, recvdOps, 
-                                            crashedNode, liveNode, req_z, 
+                                            sentOps_init, recvdOps_init, 
+                                            crashNode, objs, obj, actions, 
+                                            action, gateway_c, msg_c, uniqueId, 
+                                            outstandingOps, crashedNode, 
+                                            sender_zk, liveNode, req_z, 
                                             liveNodes, role, sender, req, 
-                                            pendingInvos, now >>
+                                            pendingInvos, failoverPendingInvos, 
+                                            now, failoverUnpropagatedWrites, 
+                                            failoverAckdWrites, version, 
+                                            pendingInvo >>
 
 handleWriteResp(self) == /\ pc[self] = "handleWriteResp"
                          /\ objLogs' = [objLogs EXCEPT ![self][req[self].op.obj] = CommitDirtyVersion(@, req[self].op)]
@@ -1426,11 +1921,15 @@ handleWriteResp(self) == /\ pc[self] = "handleWriteResp"
                                          actions_init, action_init, 
                                          gateway_cinit, msg_cinit, 
                                          uniqueId_cinit, sentOps_init, 
-                                         recvdOps_init, objs, obj, actions, 
-                                         action, gateway_c, msg_c, uniqueId, 
-                                         sentOps, recvdOps, crashedNode, 
-                                         liveNode, req_z, liveNodes, role, 
-                                         sender, req, now >>
+                                         recvdOps_init, crashNode, objs, obj, 
+                                         actions, action, gateway_c, msg_c, 
+                                         uniqueId, outstandingOps, crashedNode, 
+                                         sender_zk, liveNode, req_z, liveNodes, 
+                                         role, sender, req, 
+                                         failoverPendingInvos, now, 
+                                         failoverUnpropagatedWrites, 
+                                         failoverAckdWrites, version, 
+                                         pendingInvo >>
 
 finishWriteResp(self) == /\ pc[self] = "finishWriteResp"
                          /\ pc' = [pc EXCEPT ![self] = "listen"]
@@ -1444,24 +1943,28 @@ finishWriteResp(self) == /\ pc[self] = "finishWriteResp"
                                          actions_init, action_init, 
                                          gateway_cinit, msg_cinit, 
                                          uniqueId_cinit, sentOps_init, 
-                                         recvdOps_init, objs, obj, actions, 
-                                         action, gateway_c, msg_c, uniqueId, 
-                                         sentOps, recvdOps, crashedNode, 
-                                         liveNode, req_z, liveNodes, role, 
-                                         sender, req, pendingInvos, now >>
+                                         recvdOps_init, crashNode, objs, obj, 
+                                         actions, action, gateway_c, msg_c, 
+                                         uniqueId, outstandingOps, crashedNode, 
+                                         sender_zk, liveNode, req_z, liveNodes, 
+                                         role, sender, req, pendingInvos, 
+                                         failoverPendingInvos, now, 
+                                         failoverUnpropagatedWrites, 
+                                         failoverAckdWrites, version, 
+                                         pendingInvo >>
 
-failoverCrashedNodePredecessor(self) == /\ pc[self] = "failoverCrashedNodePredecessor"
-                                        /\ IF HasOutstandingWrites(self)
-                                              THEN /\ msgQs' = [msgQs EXCEPT ![<<self, (Successors[Successors[self]])>>] = Append(@, ([callType |-> FAILOVER_PROPAGATE_LOG]))]
-                                              ELSE /\ TRUE
-                                                   /\ msgQs' = msgQs
-                                        /\ pc' = [pc EXCEPT ![self] = "finishCrashedNodePredecessor"]
-                                        /\ UNCHANGED << failoverMsgQs, objLogs, 
+failoverCrashedNodeIsSuccessor(self) == /\ pc[self] = "failoverCrashedNodeIsSuccessor"
+                                        /\ failoverMsgQs' = [failoverMsgQs EXCEPT ![<<self, (Successors[Successors[self]])>>] = Append(@, ([  callType |-> FAILOVER_PROPAGATE_LOG,
+                                                                                                                                              log |-> objLogs[self]
+                                                                                                                                            ]))]
+                                        /\ Successors' = [Successors EXCEPT ![self] = Successors[Successors[self]]]
+                                        /\ pc' = [pc EXCEPT ![self] = "finishCrashedNodeIsSuccessor"]
+                                        /\ UNCHANGED << msgQs, objLogs, 
                                                         allSubmittedWriteOps, 
                                                         allSubmittedReadOps, 
                                                         terminatedYet, 
                                                         nonInitClients, start, 
-                                                        timeOracle, Successors, 
+                                                        timeOracle, 
                                                         Predecessors, 
                                                         currentHead, 
                                                         currentTail, 
@@ -1473,18 +1976,25 @@ failoverCrashedNodePredecessor(self) == /\ pc[self] = "failoverCrashedNodePredec
                                                         msg_cinit, 
                                                         uniqueId_cinit, 
                                                         sentOps_init, 
-                                                        recvdOps_init, objs, 
-                                                        obj, actions, action, 
+                                                        recvdOps_init, 
+                                                        crashNode, objs, obj, 
+                                                        actions, action, 
                                                         gateway_c, msg_c, 
-                                                        uniqueId, sentOps, 
-                                                        recvdOps, crashedNode, 
+                                                        uniqueId, 
+                                                        outstandingOps, 
+                                                        crashedNode, sender_zk, 
                                                         liveNode, req_z, 
                                                         liveNodes, role, 
                                                         sender, req, 
-                                                        pendingInvos, now >>
+                                                        pendingInvos, 
+                                                        failoverPendingInvos, 
+                                                        now, 
+                                                        failoverUnpropagatedWrites, 
+                                                        failoverAckdWrites, 
+                                                        version, pendingInvo >>
 
-finishCrashedNodePredecessor(self) == /\ pc[self] = "finishCrashedNodePredecessor"
-                                      /\ pc' = [pc EXCEPT ![self] = "listen"]
+finishCrashedNodeIsSuccessor(self) == /\ pc[self] = "finishCrashedNodeIsSuccessor"
+                                      /\ pc' = [pc EXCEPT ![self] = "failoverListen"]
                                       /\ UNCHANGED << msgQs, failoverMsgQs, 
                                                       objLogs, 
                                                       allSubmittedWriteOps, 
@@ -1501,30 +2011,373 @@ finishCrashedNodePredecessor(self) == /\ pc[self] = "finishCrashedNodePredecesso
                                                       gateway_cinit, msg_cinit, 
                                                       uniqueId_cinit, 
                                                       sentOps_init, 
-                                                      recvdOps_init, objs, obj, 
-                                                      actions, action, 
-                                                      gateway_c, msg_c, 
-                                                      uniqueId, sentOps, 
-                                                      recvdOps, crashedNode, 
+                                                      recvdOps_init, crashNode, 
+                                                      objs, obj, actions, 
+                                                      action, gateway_c, msg_c, 
+                                                      uniqueId, outstandingOps, 
+                                                      crashedNode, sender_zk, 
                                                       liveNode, req_z, 
                                                       liveNodes, role, sender, 
-                                                      req, pendingInvos, now >>
+                                                      req, pendingInvos, 
+                                                      failoverPendingInvos, 
+                                                      now, 
+                                                      failoverUnpropagatedWrites, 
+                                                      failoverAckdWrites, 
+                                                      version, pendingInvo >>
+
+failoverCrashedNodeIsPredecessor(self) == /\ pc[self] = "failoverCrashedNodeIsPredecessor"
+                                          /\ \E temp \in {s \in SendersTo(self): failoverMsgQs[<<s, self>>] /= << >>}:
+                                               sender' = [sender EXCEPT ![self] = temp]
+                                          /\ failoverMsgQs[<<sender'[self], self>>] /= << >>
+                                          /\ req' = [req EXCEPT ![self] = Head(failoverMsgQs[<<sender'[self], self>>])]
+                                          /\ failoverMsgQs' = [failoverMsgQs EXCEPT ![<<sender'[self], self>>] = Tail(@)]
+                                          /\ Assert((req'[self].callType = FAILOVER_PROPAGATE_LOG), 
+                                                    "Failure of assertion at line 717, column 9.")
+                                          /\ failoverUnpropagatedWrites' = [failoverUnpropagatedWrites EXCEPT ![self] = FindUnpropagatedWrites(req'[self].log, objLogs[self], Objects)]
+                                          /\ pc' = [pc EXCEPT ![self] = "propagateFailedWrites"]
+                                          /\ UNCHANGED << msgQs, objLogs, 
+                                                          allSubmittedWriteOps, 
+                                                          allSubmittedReadOps, 
+                                                          terminatedYet, 
+                                                          nonInitClients, 
+                                                          start, timeOracle, 
+                                                          Successors, 
+                                                          Predecessors, 
+                                                          currentHead, 
+                                                          currentTail, 
+                                                          uninitializedObjs, 
+                                                          initObj, objs_init, 
+                                                          obj_init, 
+                                                          actions_init, 
+                                                          action_init, 
+                                                          gateway_cinit, 
+                                                          msg_cinit, 
+                                                          uniqueId_cinit, 
+                                                          sentOps_init, 
+                                                          recvdOps_init, 
+                                                          crashNode, objs, obj, 
+                                                          actions, action, 
+                                                          gateway_c, msg_c, 
+                                                          uniqueId, 
+                                                          outstandingOps, 
+                                                          crashedNode, 
+                                                          sender_zk, liveNode, 
+                                                          req_z, liveNodes, 
+                                                          role, pendingInvos, 
+                                                          failoverPendingInvos, 
+                                                          now, 
+                                                          failoverAckdWrites, 
+                                                          version, pendingInvo >>
+
+propagateFailedWrites(self) == /\ pc[self] = "propagateFailedWrites"
+                               /\ IF failoverUnpropagatedWrites[self] /= {}
+                                     THEN /\ version' = [version EXCEPT ![self] = CHOOSE v \in failoverUnpropagatedWrites[self] : TRUE]
+                                          /\ objLogs' = [objLogs EXCEPT ![self][version'[self].obj] = Cons(version'[self], @)]
+                                          /\ msgQs' = [msgQs EXCEPT ![<<self, (Successors[self])>>] = Append(@, ([  callType |-> WRITE_INV,
+                                                                                                                    uniqueId |-> version'[self].uniqueId,
+                                                                                                                    startTs |-> version'[self].writeStartTs,
+                                                                                                                    commitTs |-> NullTs,
+                                                                                                                    op |-> version'[self]]))]
+                                          /\ pendingInvos' = [pendingInvos EXCEPT ![self] = pendingInvos[self] \cup {<<(version'[self].uniqueId), sender[self]>>}]
+                                          /\ failoverUnpropagatedWrites' = [failoverUnpropagatedWrites EXCEPT ![self] = failoverUnpropagatedWrites[self] \ {version'[self]}]
+                                          /\ pc' = [pc EXCEPT ![self] = "propagateFailedWrites"]
+                                          /\ UNCHANGED failoverAckdWrites
+                                     ELSE /\ failoverAckdWrites' = [failoverAckdWrites EXCEPT ![self] = FindAckdWrites(req[self].log, objLogs[self], Objects)]
+                                          /\ pc' = [pc EXCEPT ![self] = "backpropFailedAcks"]
+                                          /\ UNCHANGED << msgQs, objLogs, 
+                                                          pendingInvos, 
+                                                          failoverUnpropagatedWrites, 
+                                                          version >>
+                               /\ UNCHANGED << failoverMsgQs, 
+                                               allSubmittedWriteOps, 
+                                               allSubmittedReadOps, 
+                                               terminatedYet, nonInitClients, 
+                                               start, timeOracle, Successors, 
+                                               Predecessors, currentHead, 
+                                               currentTail, uninitializedObjs, 
+                                               initObj, objs_init, obj_init, 
+                                               actions_init, action_init, 
+                                               gateway_cinit, msg_cinit, 
+                                               uniqueId_cinit, sentOps_init, 
+                                               recvdOps_init, crashNode, objs, 
+                                               obj, actions, action, gateway_c, 
+                                               msg_c, uniqueId, outstandingOps, 
+                                               crashedNode, sender_zk, 
+                                               liveNode, req_z, liveNodes, 
+                                               role, sender, req, 
+                                               failoverPendingInvos, now, 
+                                               pendingInvo >>
+
+backpropFailedAcks(self) == /\ pc[self] = "backpropFailedAcks"
+                            /\ IF failoverAckdWrites[self] /= {}
+                                  THEN /\ version' = [version EXCEPT ![self] = CHOOSE v \in failoverAckdWrites[self] : TRUE]
+                                       /\ msgQs' = [msgQs EXCEPT ![<<self, (Predecessors[Predecessors[self]])>>] = Append(@, ([  callType |-> WRITE_RESP,
+                                                                                                                                 uniqueId |-> version'[self].uniqueId,
+                                                                                                                                 startTs |-> version'[self].writeStartTs,
+                                                                                                                                 commitTs |-> version'[self].writeCommitTs,
+                                                                                                                                 op |-> version'[self]]))]
+                                       /\ pc' = [pc EXCEPT ![self] = "backpropFailedAcks"]
+                                  ELSE /\ pc' = [pc EXCEPT ![self] = "notifyTail"]
+                                       /\ UNCHANGED << msgQs, version >>
+                            /\ UNCHANGED << failoverMsgQs, objLogs, 
+                                            allSubmittedWriteOps, 
+                                            allSubmittedReadOps, terminatedYet, 
+                                            nonInitClients, start, timeOracle, 
+                                            Successors, Predecessors, 
+                                            currentHead, currentTail, 
+                                            uninitializedObjs, initObj, 
+                                            objs_init, obj_init, actions_init, 
+                                            action_init, gateway_cinit, 
+                                            msg_cinit, uniqueId_cinit, 
+                                            sentOps_init, recvdOps_init, 
+                                            crashNode, objs, obj, actions, 
+                                            action, gateway_c, msg_c, uniqueId, 
+                                            outstandingOps, crashedNode, 
+                                            sender_zk, liveNode, req_z, 
+                                            liveNodes, role, sender, req, 
+                                            pendingInvos, failoverPendingInvos, 
+                                            now, failoverUnpropagatedWrites, 
+                                            failoverAckdWrites, pendingInvo >>
+
+notifyTail(self) == /\ pc[self] = "notifyTail"
+                    /\ failoverMsgQs' = [failoverMsgQs EXCEPT ![<<self, currentTail>>] = Append(@, ([callType |-> FAILOVER_NOTIFY_TAIL]))]
+                    /\ Predecessors' = [Predecessors EXCEPT ![self] = Predecessors[Predecessors[self]]]
+                    /\ pc' = [pc EXCEPT ![self] = "finishCrashedNodeIsPredecessor"]
+                    /\ UNCHANGED << msgQs, objLogs, allSubmittedWriteOps, 
+                                    allSubmittedReadOps, terminatedYet, 
+                                    nonInitClients, start, timeOracle, 
+                                    Successors, currentHead, currentTail, 
+                                    uninitializedObjs, initObj, objs_init, 
+                                    obj_init, actions_init, action_init, 
+                                    gateway_cinit, msg_cinit, uniqueId_cinit, 
+                                    sentOps_init, recvdOps_init, crashNode, 
+                                    objs, obj, actions, action, gateway_c, 
+                                    msg_c, uniqueId, outstandingOps, 
+                                    crashedNode, sender_zk, liveNode, req_z, 
+                                    liveNodes, role, sender, req, pendingInvos, 
+                                    failoverPendingInvos, now, 
+                                    failoverUnpropagatedWrites, 
+                                    failoverAckdWrites, version, pendingInvo >>
+
+finishCrashedNodeIsPredecessor(self) == /\ pc[self] = "finishCrashedNodeIsPredecessor"
+                                        /\ pc' = [pc EXCEPT ![self] = "failoverListen"]
+                                        /\ UNCHANGED << msgQs, failoverMsgQs, 
+                                                        objLogs, 
+                                                        allSubmittedWriteOps, 
+                                                        allSubmittedReadOps, 
+                                                        terminatedYet, 
+                                                        nonInitClients, start, 
+                                                        timeOracle, Successors, 
+                                                        Predecessors, 
+                                                        currentHead, 
+                                                        currentTail, 
+                                                        uninitializedObjs, 
+                                                        initObj, objs_init, 
+                                                        obj_init, actions_init, 
+                                                        action_init, 
+                                                        gateway_cinit, 
+                                                        msg_cinit, 
+                                                        uniqueId_cinit, 
+                                                        sentOps_init, 
+                                                        recvdOps_init, 
+                                                        crashNode, objs, obj, 
+                                                        actions, action, 
+                                                        gateway_c, msg_c, 
+                                                        uniqueId, 
+                                                        outstandingOps, 
+                                                        crashedNode, sender_zk, 
+                                                        liveNode, req_z, 
+                                                        liveNodes, role, 
+                                                        sender, req, 
+                                                        pendingInvos, 
+                                                        failoverPendingInvos, 
+                                                        now, 
+                                                        failoverUnpropagatedWrites, 
+                                                        failoverAckdWrites, 
+                                                        version, pendingInvo >>
+
+failoverTailPropsLog(self) == /\ pc[self] = "failoverTailPropsLog"
+                              /\ failoverMsgQs' = [failoverMsgQs EXCEPT ![<<self, (Successors[self])>>] = Append(@, ([  callType |-> FAILOVER_PROPAGATE_LOG,
+                                                                                                                        log |-> objLogs[self]
+                                                                                                                      ]))]
+                              /\ pc' = [pc EXCEPT ![self] = "finishFailoverTailPropsLog"]
+                              /\ UNCHANGED << msgQs, objLogs, 
+                                              allSubmittedWriteOps, 
+                                              allSubmittedReadOps, 
+                                              terminatedYet, nonInitClients, 
+                                              start, timeOracle, Successors, 
+                                              Predecessors, currentHead, 
+                                              currentTail, uninitializedObjs, 
+                                              initObj, objs_init, obj_init, 
+                                              actions_init, action_init, 
+                                              gateway_cinit, msg_cinit, 
+                                              uniqueId_cinit, sentOps_init, 
+                                              recvdOps_init, crashNode, objs, 
+                                              obj, actions, action, gateway_c, 
+                                              msg_c, uniqueId, outstandingOps, 
+                                              crashedNode, sender_zk, liveNode, 
+                                              req_z, liveNodes, role, sender, 
+                                              req, pendingInvos, 
+                                              failoverPendingInvos, now, 
+                                              failoverUnpropagatedWrites, 
+                                              failoverAckdWrites, version, 
+                                              pendingInvo >>
+
+finishFailoverTailPropsLog(self) == /\ pc[self] = "finishFailoverTailPropsLog"
+                                    /\ pc' = [pc EXCEPT ![self] = "failoverListen"]
+                                    /\ UNCHANGED << msgQs, failoverMsgQs, 
+                                                    objLogs, 
+                                                    allSubmittedWriteOps, 
+                                                    allSubmittedReadOps, 
+                                                    terminatedYet, 
+                                                    nonInitClients, start, 
+                                                    timeOracle, Successors, 
+                                                    Predecessors, currentHead, 
+                                                    currentTail, 
+                                                    uninitializedObjs, initObj, 
+                                                    objs_init, obj_init, 
+                                                    actions_init, action_init, 
+                                                    gateway_cinit, msg_cinit, 
+                                                    uniqueId_cinit, 
+                                                    sentOps_init, 
+                                                    recvdOps_init, crashNode, 
+                                                    objs, obj, actions, action, 
+                                                    gateway_c, msg_c, uniqueId, 
+                                                    outstandingOps, 
+                                                    crashedNode, sender_zk, 
+                                                    liveNode, req_z, liveNodes, 
+                                                    role, sender, req, 
+                                                    pendingInvos, 
+                                                    failoverPendingInvos, now, 
+                                                    failoverUnpropagatedWrites, 
+                                                    failoverAckdWrites, 
+                                                    version, pendingInvo >>
+
+failoverAssumeNewTail(self) == /\ pc[self] = "failoverAssumeNewTail"
+                               /\ objLogs' = [objLogs EXCEPT ![self] = req[self].log]
+                               /\ currentTail' = self
+                               /\ pc' = [pc EXCEPT ![self] = "notifyZookeeper"]
+                               /\ UNCHANGED << msgQs, failoverMsgQs, 
+                                               allSubmittedWriteOps, 
+                                               allSubmittedReadOps, 
+                                               terminatedYet, nonInitClients, 
+                                               start, timeOracle, Successors, 
+                                               Predecessors, currentHead, 
+                                               uninitializedObjs, initObj, 
+                                               objs_init, obj_init, 
+                                               actions_init, action_init, 
+                                               gateway_cinit, msg_cinit, 
+                                               uniqueId_cinit, sentOps_init, 
+                                               recvdOps_init, crashNode, objs, 
+                                               obj, actions, action, gateway_c, 
+                                               msg_c, uniqueId, outstandingOps, 
+                                               crashedNode, sender_zk, 
+                                               liveNode, req_z, liveNodes, 
+                                               role, sender, req, pendingInvos, 
+                                               failoverPendingInvos, now, 
+                                               failoverUnpropagatedWrites, 
+                                               failoverAckdWrites, version, 
+                                               pendingInvo >>
+
+notifyZookeeper(self) == /\ pc[self] = "notifyZookeeper"
+                         /\ msgQs' = [msgQs EXCEPT ![<<self, Zookeeper>>] = Append(@, ([ callType |-> ZK_CREATE]))]
+                         /\ pc' = [pc EXCEPT ![self] = "finishFailoverAssumeNewTail"]
+                         /\ UNCHANGED << failoverMsgQs, objLogs, 
+                                         allSubmittedWriteOps, 
+                                         allSubmittedReadOps, terminatedYet, 
+                                         nonInitClients, start, timeOracle, 
+                                         Successors, Predecessors, currentHead, 
+                                         currentTail, uninitializedObjs, 
+                                         initObj, objs_init, obj_init, 
+                                         actions_init, action_init, 
+                                         gateway_cinit, msg_cinit, 
+                                         uniqueId_cinit, sentOps_init, 
+                                         recvdOps_init, crashNode, objs, obj, 
+                                         actions, action, gateway_c, msg_c, 
+                                         uniqueId, outstandingOps, crashedNode, 
+                                         sender_zk, liveNode, req_z, liveNodes, 
+                                         role, sender, req, pendingInvos, 
+                                         failoverPendingInvos, now, 
+                                         failoverUnpropagatedWrites, 
+                                         failoverAckdWrites, version, 
+                                         pendingInvo >>
+
+finishFailoverAssumeNewTail(self) == /\ pc[self] = "finishFailoverAssumeNewTail"
+                                     /\ pc' = [pc EXCEPT ![self] = "failoverListen"]
+                                     /\ UNCHANGED << msgQs, failoverMsgQs, 
+                                                     objLogs, 
+                                                     allSubmittedWriteOps, 
+                                                     allSubmittedReadOps, 
+                                                     terminatedYet, 
+                                                     nonInitClients, start, 
+                                                     timeOracle, Successors, 
+                                                     Predecessors, currentHead, 
+                                                     currentTail, 
+                                                     uninitializedObjs, 
+                                                     initObj, objs_init, 
+                                                     obj_init, actions_init, 
+                                                     action_init, 
+                                                     gateway_cinit, msg_cinit, 
+                                                     uniqueId_cinit, 
+                                                     sentOps_init, 
+                                                     recvdOps_init, crashNode, 
+                                                     objs, obj, actions, 
+                                                     action, gateway_c, msg_c, 
+                                                     uniqueId, outstandingOps, 
+                                                     crashedNode, sender_zk, 
+                                                     liveNode, req_z, 
+                                                     liveNodes, role, sender, 
+                                                     req, pendingInvos, 
+                                                     failoverPendingInvos, now, 
+                                                     failoverUnpropagatedWrites, 
+                                                     failoverAckdWrites, 
+                                                     version, pendingInvo >>
 
 crash(self) == /\ pc[self] = "crash"
-               /\ now' = [now EXCEPT ![self] = -1]
-               /\ pc' = [pc EXCEPT ![self] = "Done"]
-               /\ UNCHANGED << msgQs, failoverMsgQs, objLogs, 
-                               allSubmittedWriteOps, allSubmittedReadOps, 
-                               terminatedYet, nonInitClients, start, 
-                               timeOracle, Successors, Predecessors, 
-                               currentHead, currentTail, uninitializedObjs, 
-                               initObj, objs_init, obj_init, actions_init, 
-                               action_init, gateway_cinit, msg_cinit, 
-                               uniqueId_cinit, sentOps_init, recvdOps_init, 
-                               objs, obj, actions, action, gateway_c, msg_c, 
-                               uniqueId, sentOps, recvdOps, crashedNode, 
+               /\ msgQs' = [msgQs EXCEPT ![<<self, Zookeeper>>] = Append(@, ([ callType |-> ZK_SESSION_ENDED]))]
+               /\ pc' = [pc EXCEPT ![self] = "zkConfigChanged"]
+               /\ UNCHANGED << failoverMsgQs, objLogs, allSubmittedWriteOps, 
+                               allSubmittedReadOps, terminatedYet, 
+                               nonInitClients, start, timeOracle, Successors, 
+                               Predecessors, currentHead, currentTail, 
+                               uninitializedObjs, initObj, objs_init, obj_init, 
+                               actions_init, action_init, gateway_cinit, 
+                               msg_cinit, uniqueId_cinit, sentOps_init, 
+                               recvdOps_init, crashNode, objs, obj, actions, 
+                               action, gateway_c, msg_c, uniqueId, 
+                               outstandingOps, crashedNode, sender_zk, 
                                liveNode, req_z, liveNodes, role, sender, req, 
-                               pendingInvos >>
+                               pendingInvos, failoverPendingInvos, now, 
+                               failoverUnpropagatedWrites, failoverAckdWrites, 
+                               version, pendingInvo >>
+
+zkConfigChanged(self) == /\ pc[self] = "zkConfigChanged"
+                         /\ \E temp \in {s \in SendersTo(self): failoverMsgQs[<<s, self>>] /= << >>}:
+                              sender' = [sender EXCEPT ![self] = temp]
+                         /\ failoverMsgQs[<<sender'[self], self>>] /= << >>
+                         /\ req' = [req EXCEPT ![self] = Head(failoverMsgQs[<<sender'[self], self>>])]
+                         /\ failoverMsgQs' = [failoverMsgQs EXCEPT ![<<sender'[self], self>>] = Tail(@)]
+                         /\ Assert((req'[self].callType = ZK_NODE_ADD), 
+                                   "Failure of assertion at line 789, column 9.")
+                         /\ pc' = [pc EXCEPT ![self] = "Done"]
+                         /\ UNCHANGED << msgQs, objLogs, allSubmittedWriteOps, 
+                                         allSubmittedReadOps, terminatedYet, 
+                                         nonInitClients, start, timeOracle, 
+                                         Successors, Predecessors, currentHead, 
+                                         currentTail, uninitializedObjs, 
+                                         initObj, objs_init, obj_init, 
+                                         actions_init, action_init, 
+                                         gateway_cinit, msg_cinit, 
+                                         uniqueId_cinit, sentOps_init, 
+                                         recvdOps_init, crashNode, objs, obj, 
+                                         actions, action, gateway_c, msg_c, 
+                                         uniqueId, outstandingOps, crashedNode, 
+                                         sender_zk, liveNode, req_z, liveNodes, 
+                                         role, pendingInvos, 
+                                         failoverPendingInvos, now, 
+                                         failoverUnpropagatedWrites, 
+                                         failoverAckdWrites, version, 
+                                         pendingInvo >>
 
 n(self) == roleAssignment(self) \/ listen(self) \/ failoverListen(self)
               \/ handleReadInv(self) \/ apportionQ(self)
@@ -1535,16 +2388,25 @@ n(self) == roleAssignment(self) \/ listen(self) \/ failoverListen(self)
               \/ finishWriteInv(self) \/ handleWriteInvTail(self)
               \/ tailAck(self) \/ finishWriteInvTail(self)
               \/ handleWriteResp(self) \/ finishWriteResp(self)
-              \/ failoverCrashedNodePredecessor(self)
-              \/ finishCrashedNodePredecessor(self) \/ crash(self)
+              \/ failoverCrashedNodeIsSuccessor(self)
+              \/ finishCrashedNodeIsSuccessor(self)
+              \/ failoverCrashedNodeIsPredecessor(self)
+              \/ propagateFailedWrites(self) \/ backpropFailedAcks(self)
+              \/ notifyTail(self) \/ finishCrashedNodeIsPredecessor(self)
+              \/ failoverTailPropsLog(self)
+              \/ finishFailoverTailPropsLog(self)
+              \/ failoverAssumeNewTail(self) \/ notifyZookeeper(self)
+              \/ finishFailoverAssumeNewTail(self) \/ crash(self)
+              \/ zkConfigChanged(self)
 
-Next == iclient \/ zk
+Next == iclient \/ crasher \/ zk
            \/ (\E self \in nonInitClients: c(self))
            \/ (\E self \in Nodes: n(self))
 
 Spec == /\ Init /\ [][Next]_vars
         /\ WF_vars(Next)
         /\ WF_vars(iclient)
+        /\ WF_vars(crasher)
         /\ \A self \in nonInitClients : WF_vars(c(self))
         /\ WF_vars(zk)
         /\ \A self \in Nodes : WF_vars(n(self))
@@ -1573,15 +2435,15 @@ InitClientTypeInvariant ==  /\ \A uninitObj \in uninitializedObjs: uninitObj \in
                             /\ msg_cinit \in RequestType \cup {NullReq}
                             /\ uniqueId_cinit \in UniqueIdType \cup {NullUniqueId}
                             
-ClientTypeInvariant ==  \*/\ \A objInited \in objs: objInited \in [Clients -> Objects]
-                        /\ obj \in [Clients \ {initClient} -> Objects]
-                        /\ actions \in [Clients \ {initClient} -> SUBSET({WRITE_INV, READ_INV})]
-                        /\ action \in [Clients \ {initClient} -> {WRITE_INV, READ_INV}]
-                        /\ gateway_c \in [Clients \ {initClient} -> Nodes \cup {NullNode}]
-                        /\ sentOps \in [Clients \ {initClient} -> Nat]
-                        /\ recvdOps \in [Clients \ {initClient} -> Nat]
-                        /\ msg_c \in [Clients \ {initClient} -> RequestType \cup {NullReq}]
-                        /\ uniqueId \in [Clients \ {initClient} -> UniqueIdType]
+\*ClientTypeInvariant ==  \*/\ \A objInited \in objs: objInited \in [Clients -> Objects]
+\*                        /\ obj \in [Clients \ {initClient} -> Objects]
+\*                        /\ actions \in [Clients \ {initClient} -> SUBSET({WRITE_INV, READ_INV})]
+\*                        /\ action \in [Clients \ {initClient} -> {WRITE_INV, READ_INV}]
+\*                        /\ gateway_c \in [Clients \ {initClient} -> Nodes \cup {NullNode}]
+\*                        /\ sentOps \in [Clients \ {initClient} -> Nat]
+\*                        /\ recvdOps \in [Clients \ {initClient} -> Nat]
+\*                        /\ msg_c \in [Clients \ {initClient} -> RequestType \cup {NullReq}]
+\*                        /\ uniqueId \in [Clients \ {initClient} -> UniqueIdType]
 
                         
 NodeTypeInvariant ==    /\ req \in [Nodes \ {head, tail} -> RequestType \cup {NullReq}]
@@ -1630,6 +2492,6 @@ Linearizability == IsLinearizable
 
 =============================================================================
 \* Modification History
+\* Last modified Sun Sep 10 01:14:58 EDT 2023 by jenniferlam
 \* Last modified Fri Sep 08 23:57:50 EDT 2023 by 72jen
-\* Last modified Fri Sep 08 18:14:59 EDT 2023 by jenniferlam
 \* Created Tue Jun 13 12:56:59 EDT 2023 by jenniferlam
